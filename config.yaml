@@ -1,0 +1,57 @@
+server:
+  port: ":8080"
+  timeout: 30s
+
+database:
+  uri: "mongodb://localhost:27017"
+  name: "media_manager"
+
+logger:
+  level: "debug"
+  format: "text"
+  path: "./logs"
+  
+scanner:
+  # =================================================================
+  # 重要：请将下面的路径修改为您自己电脑上的实际路径！
+  # =================================================================
+  # 扫描路径：新文件被发现的入口。
+  scanPath: "F:/Test/Test_NewFiles"
+  # 中转站路径：程序处理过程中的临时工作区。
+  stagingPath: "F:/Test/Test_Staging"
+  # 最终库路径：所有文件最终被整理、归档和存放的地方。
+  finalLibraryPath: "F:/Test/Test_Library"
+  # 备份文件的根目录
+  backupPath: "F:/Test/Test_Backups"
+  # 隔离区路径
+  quarantinePath: "F:/Test/Test_Quarantined"
+  # 错误文件日志
+  corruptionLogPath: "./corrupted_files.log"
+  # 用于存放扫描时发现的、数据库中已存在的重复文件的目录名。
+  # 它将被创建在 scanPath 目录下。
+  duplicatesDir: "_duplicates"
+
+  # 可选：指定并发worker的数量。
+  # 如果设置为 0 或不设置此项，程序将自动使用您电脑的CPU核心数。
+  workerCount: 0
+
+  # 数据库批量写入的大小。建议值为 100-500。
+  # 设置为 0 或不设置，将使用默认值 100。
+  batchSize: 100
+  
+  # --- 用于“文件分类”的严格规则 (从文件名提取系列名) ---
+  filePatterns:
+    - '^(.*?)_(\d+)_p(\d+)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_(\d+)_p(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_pg(\d+)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_(\d+)_p(\d+).(\.[a-zA-Z0-9_]+)?$'
+
+  # --- 用于“目录聚合”的智能规则 (从系列文件夹名提取集合名) ---
+  seriesGroupPatterns:
+    - name: "前置序号"  # name 字段用于日志，方便调试
+      pattern: '^\s*\(\d+\)\s*(?P<group>.*)'
+    - name: "括号"
+      pattern: '^[『「《[(【（](?P<group>.*?)[』」》)\]】）]'
+    - name: "文本+数字"
+      pattern: '^(?P<group>.+?)\s*(\d+)$'

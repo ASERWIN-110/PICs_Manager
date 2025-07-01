@@ -1,0 +1,2 @@
+CLASSIFY: 2025/07/01 23:53:25 classifier.go:57: workerCount 未设置或为0, 自动使用CPU核心数: 16
+CLASSIFY: 2025/07/01 23:53:25 classifier.go:61: ================== 新的分类任务开始 ==================

@@ -1,0 +1,595 @@
+package scanner
+
+import (
+	"PICs_Manager/config"
+	"PICs_Manager/internal/models"
+	"PICs_Manager/pkg/database"
+	"PICs_Manager/pkg/hasher"
+	"PICs_Manager/pkg/thumbnailer"
+	"context"
+
+	"fmt"
+	"image"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/mozillazg/go-pinyin"
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
+)
+
+var (
+	logMutex         sync.Mutex
+	illegalNameChars = regexp.MustCompile(`[<>:"/\\|?*]`)
+)
+
+// IngestJob 用于在处理和入库阶段传递数据
+type IngestJob struct {
+	Image      *models.Image
+	SourcePath string
+}
+
+func getNormalizedInitial(name string) (string, error) {
+	if name == "" {
+		return "#", nil
+	}
+	var firstMeaningfulChar rune = -1
+	for _, r := range name {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			firstMeaningfulChar = r
+			break
+		}
+	}
+	if firstMeaningfulChar == -1 {
+		return "#", nil
+	}
+	charStr := string(firstMeaningfulChar)
+	if unicode.Is(unicode.Han, firstMeaningfulChar) {
+		pinyinArgs := pinyin.NewArgs()
+		pinyinResult := pinyin.Pinyin(charStr, pinyinArgs)
+		if len(pinyinResult) > 0 && len(pinyinResult[0]) > 0 {
+			firstPinyin := pinyinResult[0][0]
+			if len(firstPinyin) > 0 {
+				return strings.ToUpper(string(firstPinyin[0])), nil
+			}
+		}
+	}
+	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+	result, _, err := transform.String(t, charStr)
+	if err != nil {
+		return "#", err
+	}
+	if result != "" {
+		firstASCIIChar := rune(result[0])
+		if (firstASCIIChar >= 'a' && firstASCIIChar <= 'z') || (firstASCIIChar >= 'A' && firstASCIIChar <= 'Z') {
+			return strings.ToUpper(string(firstASCIIChar)), nil
+		}
+	}
+	return "#", nil
+}
+
+func sanitizeName(name string) string {
+	sanitized := illegalNameChars.ReplaceAllString(name, "")
+	sanitized = strings.TrimRight(sanitized, ". ")
+	sanitized = strings.TrimLeft(sanitized, ". ")
+	return sanitized
+}
+
+type Scanner struct {
+	db                 database.Store
+	Cfg                config.ScannerConfig
+	fileRegexps        []*regexp.Regexp
+	seriesGroupRegexps map[string]*regexp.Regexp
+}
+
+func NewScanner(db database.Store, Cfg *config.Config) (*Scanner, error) {
+	s := &Scanner{db: db, Cfg: Cfg.Scanner, seriesGroupRegexps: make(map[string]*regexp.Regexp)}
+	for _, p := range Cfg.Scanner.FilePatterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, err
+		}
+		s.fileRegexps = append(s.fileRegexps, re)
+	}
+	for name, p := range Cfg.Scanner.SeriesGroupPatterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, err
+		}
+		s.seriesGroupRegexps[name] = re
+	}
+	return s, nil
+}
+
+// Scan 启动一个完全单线程的、分阶段的扫描流程。
+func (s *Scanner) Scan(ctx context.Context) error {
+	slog.Info("扫描任务开始", "源路径", s.Cfg.ScanPath, "目标路径", s.Cfg.DestPath)
+	if err := os.MkdirAll(s.Cfg.DestPath, 0755); err != nil {
+		return err
+	}
+	slog.Info("阶段一：开始预处理、复制并归类文件...")
+	if err := s.preProcessAndCopyFiles(ctx, s.Cfg.ScanPath, s.Cfg.DestPath); err != nil {
+		slog.Error("阶段一执行失败", "error", err)
+		return err
+	}
+	slog.Info("阶段一：文件归类完成。")
+	slog.Info("阶段二：开始聚合系列文件夹...")
+	if err := s.groupSeriesToCollection(ctx, s.Cfg.DestPath); err != nil {
+		slog.Error("阶段二执行失败", "error", err)
+		return err
+	}
+	slog.Info("阶段二：系列聚合完成。")
+	slog.Info("阶段三：开始按首字母归档...")
+	if err := s.finalSortByInitial(ctx, s.Cfg.DestPath); err != nil {
+		slog.Error("阶段三执行失败", "error", err)
+		return err
+	}
+	slog.Info("阶段三：首字母归档完成。")
+	slog.Info("阶段四：开始扫描并入库...")
+	if err := s.ingestIntoDatabase(ctx, s.Cfg.DestPath); err != nil {
+		slog.Error("阶段四执行失败", "error", err)
+		return err
+	}
+	slog.Info("阶段四：数据入库完成。")
+	slog.Info("阶段五：开始更新系列元数据...")
+	if err := s.updateSeriesMetadata(ctx); err != nil {
+		slog.Error("阶段五执行失败", "error", err)
+	} else {
+		slog.Info("阶段五：系列元数据更新完成。")
+	}
+	slog.Info("扫描任务全部成功完成")
+	return nil
+}
+
+// preProcessAndCopyFiles 单线程执行文件预处理和复制
+func (s *Scanner) preProcessAndCopyFiles(ctx context.Context, srcRoot, destRoot string) error {
+	// 在单线程模式下，我们用一个简单的map来记录本次扫描已处理的路径
+	processedPaths := make(map[string]bool)
+
+	return filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() && d.Name() == s.Cfg.DuplicatesDir {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && isImageFile(path) {
+			s.preProcessAndCopySingleFile(ctx, path, destRoot, processedPaths)
+		}
+		return nil
+	})
+}
+
+func (s *Scanner) preProcessAndCopySingleFile(ctx context.Context, sourcePath, destRoot string, processedPaths map[string]bool) {
+	file, err := os.Open(sourcePath)
+	if err != nil {
+		return
+	}
+	_, _, err = image.Decode(file)
+	file.Close()
+	if err != nil {
+		repairedPath, wasRepaired := s.resolveCorruptedFile(ctx, sourcePath)
+		if !wasRepaired {
+			slog.Error("文件损坏且无法修复，已记录日志", "path", sourcePath)
+			logCorruptedFile(s.Cfg.CorruptionLogPath, sourcePath)
+			return
+		}
+		sourcePath = repairedPath
+	}
+
+	var seriesName string
+	fileName := filepath.Base(sourcePath)
+	for _, re := range s.fileRegexps {
+		matches := re.FindStringSubmatch(fileName)
+		if len(matches) > 1 {
+			seriesName = sanitizeName(matches[1])
+			break
+		}
+	}
+
+	if seriesName == "" || len(seriesName) == 0 {
+		slog.Warn("文件不符合归类规则，已跳过", "file", sourcePath)
+		return
+	}
+
+	destSeriesPath := filepath.Join(destRoot, seriesName)
+	destFilePath := filepath.Join(destSeriesPath, fileName)
+
+	// --- 核心修正点：基于目标文件路径进行去重 ---
+	existingImage, _ := s.db.Images().GetByFilePath(ctx, destFilePath)
+	if existingImage != nil {
+		s.moveToDuplicates(sourcePath, "数据库中已存在该目标路径")
+		return
+	}
+	if processedPaths[destFilePath] {
+		s.moveToDuplicates(sourcePath, "本次扫描中已处理相同目标路径的文件")
+		return
+	}
+
+	// 标记此路径为已处理
+	processedPaths[destFilePath] = true
+
+	if err := os.MkdirAll(destSeriesPath, 0755); err != nil {
+		slog.Error("创建目标系列目录失败", "path", destSeriesPath, "error", err)
+		return
+	}
+	if err := copyFile(sourcePath, destFilePath); err != nil {
+		slog.Error("复制文件失败", "from", sourcePath, "to", destFilePath, "error", err)
+	}
+}
+
+func (s *Scanner) moveToDuplicates(sourcePath, reason string) {
+	slog.Info("发现重复文件，移动到隔离区", "file", sourcePath, "reason", reason)
+	duplicatesPath := filepath.Join(s.Cfg.ScanPath, s.Cfg.DuplicatesDir)
+	if err := os.MkdirAll(duplicatesPath, 0755); err != nil {
+		slog.Error("创建重复文件隔离区失败", "path", duplicatesPath, "error", err)
+		return
+	}
+	destDupPath := filepath.Join(duplicatesPath, filepath.Base(sourcePath))
+	if err := os.Rename(sourcePath, destDupPath); err != nil {
+		if os.IsExist(err) {
+			ext := filepath.Ext(destDupPath)
+			base := strings.TrimSuffix(destDupPath, ext)
+			destDupPath = fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext)
+			err = os.Rename(sourcePath, destDupPath)
+		}
+		if err != nil {
+			slog.Error("移动重复文件失败", "from", sourcePath, "to", destDupPath, "error", err)
+		}
+	}
+}
+
+func (s *Scanner) groupSeriesToCollection(ctx context.Context, path string) error {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	groups := make(map[string][]string)
+	dirNames := []string{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirNames = append(dirNames, entry.Name())
+		}
+	}
+	rulePriority := []string{"brackets", "leadingNumber", "textAndNumber"}
+	for _, dirName := range dirNames {
+		var groupName string
+		for _, ruleName := range rulePriority {
+			if re, ok := s.seriesGroupRegexps[ruleName]; ok {
+				matches := re.FindStringSubmatch(dirName)
+				if len(matches) > 0 {
+					for i, name := range re.SubexpNames() {
+						if name == "group" && i < len(matches) {
+							groupName = sanitizeName(matches[i])
+							break
+						}
+					}
+				}
+			}
+			if groupName != "" {
+				slog.Debug("目录聚合规则匹配", "目录", dirName, "规则", ruleName, "集合", groupName)
+				break
+			}
+		}
+		if groupName == "" {
+			var prefix string
+			if idx := strings.Index(dirName, " "); idx > 0 {
+				prefix = dirName[:idx]
+			} else if idx := strings.Index(dirName, "_"); idx > 0 {
+				prefix = dirName[:idx]
+			}
+			if prefix != "" {
+				groupName = sanitizeName(prefix)
+			}
+		}
+		if groupName != "" {
+			groups[groupName] = append(groups[groupName], dirName)
+		}
+	}
+	for groupName := range groups {
+		for _, dirName := range dirNames {
+			if dirName == groupName {
+				isAlreadyInGroup := false
+				for _, member := range groups[groupName] {
+					if member == dirName {
+						isAlreadyInGroup = true
+						break
+					}
+				}
+				if !isAlreadyInGroup {
+					groups[groupName] = append(groups[groupName], dirName)
+				}
+				break
+			}
+		}
+	}
+	finalMoves := make(map[string]string)
+	for groupName, dirs := range groups {
+		dirSet := make(map[string]bool)
+		uniqueDirs := []string{}
+		for _, dir := range dirs {
+			if !dirSet[dir] {
+				dirSet[dir] = true
+				uniqueDirs = append(uniqueDirs, dir)
+			}
+		}
+		if len(uniqueDirs) < 2 {
+			continue
+		}
+		collectionPath := filepath.Join(path, groupName)
+		for _, dir := range uniqueDirs {
+			if _, exists := finalMoves[dir]; !exists {
+				finalMoves[dir] = collectionPath
+			}
+		}
+	}
+	for sourceDirName, destParentPath := range finalMoves {
+		if err := os.MkdirAll(destParentPath, 0755); err != nil {
+			slog.Error("创建集合文件夹失败", "path", destParentPath, "error", err)
+			continue
+		}
+		sourcePath := filepath.Join(path, sourceDirName)
+		destPath := filepath.Join(destParentPath, sourceDirName)
+		slog.Info("聚合系列", "from", sourcePath, "to", destPath)
+		if err := os.Rename(sourcePath, destPath); err != nil {
+			slog.Error("移动系列文件夹失败", "dir", sourceDirName, "error", err)
+		}
+	}
+	return nil
+}
+
+func (s *Scanner) finalSortByInitial(ctx context.Context, path string) error {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	targetDirs := make(map[string]bool)
+	for i := 'A'; i <= 'Z'; i++ {
+		targetDirs[string(i)] = true
+	}
+	targetDirs["#"] = true
+	for _, entry := range entries {
+		dirName := entry.Name()
+		if !entry.IsDir() || targetDirs[dirName] {
+			continue
+		}
+		initialDir, err := getNormalizedInitial(dirName)
+		if err != nil {
+			slog.Warn("获取首字母失败", "dir", dirName, "error", err)
+			continue
+		}
+		destDir := filepath.Join(path, initialDir)
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			slog.Error("创建首字母文件夹失败", "path", destDir, "error", err)
+			continue
+		}
+		sourcePath := filepath.Join(path, dirName)
+		destPath := filepath.Join(destDir, dirName)
+		if sourcePath != destPath {
+			slog.Debug("按首字母归档", "from", sourcePath, "to", destPath)
+			if err := os.Rename(sourcePath, destPath); err != nil {
+				slog.Error("归档文件夹失败", "dir", dirName, "error", err)
+			}
+		}
+	}
+	return nil
+}
+
+// ingestIntoDatabase 单线程执行入库
+func (s *Scanner) ingestIntoDatabase(ctx context.Context, rootPath string) error {
+	batchSize := s.Cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	batch := make([]*models.Image, 0, batchSize)
+
+	err := filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && isImageFile(path) {
+			// --- 核心修正点：入库阶段也使用文件路径查重 ---
+			existingImage, _ := s.db.Images().GetByFilePath(ctx, path)
+			if existingImage != nil {
+				slog.Debug("入库时发现文件路径已存在，跳过", "file", path)
+				return nil
+			}
+
+			// 只有在确定是新文件时，才进行耗时的哈希和缩略图计算
+			sha256, _ := hasher.CalculateSHA256(path)
+			pHash, _ := hasher.CalculatePerceptualHash(path)
+			var thumbnailB64 string
+			file, _ := os.Open(path)
+			if file != nil {
+				img, _, decodeErr := image.Decode(file)
+				if decodeErr == nil {
+					thumbnailB64, _ = thumbnailer.CreateBase64(img, 300, 300)
+				}
+				file.Close()
+			}
+
+			seriesPath := filepath.Dir(path)
+			series, err := s.getOrCreateSeries(ctx, seriesPath)
+			if err != nil {
+				return nil // 跳过这个文件
+			}
+
+			image := &models.Image{
+				SeriesID:       series.ID,
+				FileHash:       sha256,
+				PerceptualHash: pHash,
+				FileName:       filepath.Base(path),
+				FilePath:       path,
+				Thumbnail:      thumbnailB64,
+			}
+			batch = append(batch, image)
+			if len(batch) >= batchSize {
+				s.commitBatch(ctx, batch)
+				batch = make([]*models.Image, 0, batchSize) // 重置批次
+			}
+		}
+		return nil
+	})
+
+	// 提交最后一批未满的
+	if len(batch) > 0 {
+		s.commitBatch(ctx, batch)
+	}
+	return err
+}
+
+func (s *Scanner) commitBatch(ctx context.Context, batch []*models.Image) {
+	if len(batch) == 0 {
+		return
+	}
+	slog.Info("正在批量入库...", "数量", len(batch))
+	_, err := s.db.Images().CreateBatch(ctx, batch)
+	if err != nil {
+		slog.Error("批量入库失败", "error", err)
+		return
+	}
+	slog.Info("批量入库成功", "数量", len(batch))
+}
+
+func (s *Scanner) resolveCorruptedFile(ctx context.Context, corruptPath string) (string, bool) {
+	baseName := filepath.Base(corruptPath)
+	ext := filepath.Ext(baseName)
+	nameWithoutExt := strings.TrimSuffix(baseName, ext)
+	dir := filepath.Dir(corruptPath)
+	var filesToCleanup []string
+	for i := 1; i <= 10; i++ {
+		replacementName := fmt.Sprintf("%s (%d)%s", nameWithoutExt, i, ext)
+		replacementPath := filepath.Join(dir, replacementName)
+		if _, err := os.Stat(replacementPath); os.IsNotExist(err) {
+			continue
+		}
+		filesToCleanup = append(filesToCleanup, replacementPath)
+		file, err := os.Open(replacementPath)
+		if err != nil {
+			continue
+		}
+		_, _, err = image.Decode(file)
+		file.Close()
+		if err == nil {
+			slog.Info("找到完好替代版本", "original", corruptPath, "replacement", replacementPath)
+			_ = os.Remove(corruptPath)
+			if err := os.Rename(replacementPath, corruptPath); err != nil {
+				slog.Error("重命名替代文件失败", "from", replacementPath, "to", corruptPath, "error", err)
+				return "", false
+			}
+			for _, f := range filesToCleanup {
+				if f != replacementPath {
+					_ = os.Remove(f)
+				}
+			}
+			return corruptPath, true
+		}
+	}
+	for _, f := range filesToCleanup {
+		_ = os.Remove(f)
+	}
+	return "", false
+}
+
+func (s *Scanner) getOrCreateSeries(ctx context.Context, seriesPath string) (*models.Series, error) {
+	series, err := s.db.Series().GetByPath(ctx, seriesPath)
+	if err != nil {
+		return nil, err
+	}
+	if series != nil {
+		return series, nil
+	}
+	newSeries := &models.Series{
+		Name: filepath.Base(seriesPath),
+		Path: seriesPath,
+	}
+	if err := s.db.Series().Create(ctx, newSeries); err != nil {
+		return nil, err
+	}
+	slog.Info("创建新系列", "name", newSeries.Name, "path", newSeries.Path)
+	return newSeries, nil
+}
+
+func logCorruptedFile(logPath string, file string) {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		slog.Error("无法打开损坏文件日志", "path", logPath, "error", err)
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString(file + "\n"); err != nil {
+		slog.Error("写入损坏文件日志失败", "path", file, "error", err)
+	}
+}
+
+func copyFile(src, dst string) error {
+	sourceFileStat, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !sourceFileStat.Mode().IsRegular() {
+		return nil
+	}
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	destination, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+	_, err = io.Copy(destination, source)
+	return err
+}
+
+func isImageFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Scanner) updateSeriesMetadata(ctx context.Context) error {
+	slog.Info("开始遍历所有系列以更新元数据...")
+	allSeries, err := s.db.Series().GetAllSeries(ctx)
+	if err != nil {
+		return fmt.Errorf("获取所有系列失败: %w", err)
+	}
+	slog.Info("成功获取所有系列进行元数据更新", "count", len(allSeries))
+	for _, series := range allSeries {
+		imageCount, err := s.db.Images().CountBySeriesID(ctx, series.ID)
+		if err != nil {
+			slog.Warn("无法统计系列图片数量", "series", series.Name, "error", err)
+			continue
+		}
+		var coverThumbnail string
+		images, _, err := s.db.Images().ListBySeriesID(ctx, series.ID, 1, 1)
+		if err != nil {
+			slog.Warn("无法获取系列封面图", "series", series.Name, "error", err)
+		}
+		if len(images) > 0 {
+			coverThumbnail = images[0].Thumbnail
+		}
+		if err := s.db.Series().UpdateMetadata(ctx, series.ID, int(imageCount), coverThumbnail); err != nil {
+			slog.Error("更新系列元数据失败", "series", series.Name, "error", err)
+		} else {
+			slog.Debug("成功更新系列元数据", "series", series.Name, "count", imageCount)
+		}
+	}
+	return nil
+}

@@ -1,10 +1,11 @@
 import React, { useRef, useState, useEffect } from 'react';
 import ArticleIcon from '@mui/icons-material/Article';
 import AudiotrackIcon from '@mui/icons-material/Audiotrack';
+import DownloadIcon from '@mui/icons-material/Download';
 import ImageIcon from '@mui/icons-material/Image';
 import InsertDriveFileIcon from '@mui/icons-material/InsertDriveFile';
 import MovieIcon from '@mui/icons-material/Movie';
-import { fetchMediaBySeriesId, getConfig, resolveApiAssetUrl } from '../services/api';
+import { downloadApiFile, fetchMediaBySeriesId, getConfig, resolveApiAssetUrl } from '../services/api';
 import type { MediaItem, Pagination } from '../types/entities';
 
 const MEDIA_PAGE_SIZE = 60;
@@ -209,6 +210,14 @@ const MediaList: React.FC<MediaListProps> = ({ seriesId, onMediaContextMenu }: M
                             <div className="media-caption">
                                 <span className="media-type">{item.mediaType || activeMediaType}</span>
                                 <span className="media-name">{item.fileName}</span>
+                                <button
+                                    className="tile-action"
+                                    type="button"
+                                    title="下载媒体"
+                                    onClick={() => downloadApiFile(`/media/${item.id}/download`, item.fileName)}
+                                >
+                                    <DownloadIcon fontSize="small" />
+                                </button>
                             </div>
                         </div>
                     ))}

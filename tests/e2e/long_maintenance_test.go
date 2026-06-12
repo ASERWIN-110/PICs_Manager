@@ -211,11 +211,12 @@ func TestLongMaintenanceMongoAndAPIE2E(t *testing.T) {
 	baseURL := "http://127.0.0.1" + port
 	waitHTTP(t, baseURL+"/health", http.StatusOK, 10*time.Second, func(req *http.Request) {})
 
-	expectHTTP(t, http.MethodGet, baseURL+"/api/v1/config", "", http.StatusOK, nil)
-	expectHTTP(t, http.MethodPost, baseURL+"/api/v1/tasks", `{"path":"`+jsonEscape(scan)+`","mode":"classifyOnly"}`, http.StatusUnauthorized, nil)
-	taskBody := expectHTTP(t, http.MethodPost, baseURL+"/api/v1/tasks", `{"path":"`+jsonEscape(scan)+`","mode":"classifyOnly"}`, http.StatusAccepted, func(req *http.Request) {
+	withToken := func(req *http.Request) {
 		req.Header.Set("X-Maintenance-Token", "secret")
-	})
+	}
+	expectHTTP(t, http.MethodGet, baseURL+"/api/v1/config", "", http.StatusOK, withToken)
+	expectHTTP(t, http.MethodPost, baseURL+"/api/v1/tasks", `{"path":"`+jsonEscape(scan)+`","mode":"classifyOnly"}`, http.StatusUnauthorized, nil)
+	taskBody := expectHTTP(t, http.MethodPost, baseURL+"/api/v1/tasks", `{"path":"`+jsonEscape(scan)+`","mode":"classifyOnly"}`, http.StatusAccepted, withToken)
 	var taskStart taskStartEnvelope
 	if err := json.Unmarshal([]byte(taskBody), &taskStart); err != nil {
 		t.Fatalf("task start response invalid JSON: %v\n%s", err, taskBody)
@@ -223,8 +224,8 @@ func TestLongMaintenanceMongoAndAPIE2E(t *testing.T) {
 	if taskStart.Data.TaskID == "" {
 		t.Fatalf("task start response missing taskId: %s\nserver logs:\n%s", taskBody, logs.String())
 	}
-	waitTaskTerminal(t, baseURL, taskStart.Data.TaskID, 10*time.Second)
-	expectHTTP(t, http.MethodGet, baseURL+"/api/v1/runs", "", http.StatusOK, nil)
+	waitTaskTerminal(t, baseURL, taskStart.Data.TaskID, 10*time.Second, withToken)
+	expectHTTP(t, http.MethodGet, baseURL+"/api/v1/runs", "", http.StatusOK, withToken)
 }
 
 type e2eConfig struct {
@@ -638,12 +639,12 @@ func waitHTTP(t *testing.T, url string, status int, timeout time.Duration, mutat
 	t.Fatalf("timed out waiting for %s status %d: %v", url, status, lastErr)
 }
 
-func waitTaskTerminal(t *testing.T, baseURL, taskID string, timeout time.Duration) {
+func waitTaskTerminal(t *testing.T, baseURL, taskID string, timeout time.Duration, mutate func(*http.Request)) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last taskStatusEnvelope
 	for time.Now().Before(deadline) {
-		body := expectHTTP(t, http.MethodGet, baseURL+"/api/v1/tasks/"+taskID, "", http.StatusOK, nil)
+		body := expectHTTP(t, http.MethodGet, baseURL+"/api/v1/tasks/"+taskID, "", http.StatusOK, mutate)
 		if err := json.Unmarshal([]byte(body), &last); err != nil {
 			t.Fatalf("task status response invalid JSON: %v\n%s", err, body)
 		}

@@ -418,6 +418,7 @@ func (m *Manager) finishTask(task *Task, status TaskStatus, progress float64, er
 		Error:      errMessage,
 		Checkpoint: true,
 	})
+	m.pruneRunRetention()
 }
 
 func (m *Manager) pruneFinishedTasksLocked() {
@@ -451,6 +452,21 @@ func (m *Manager) pruneFinishedTasksLocked() {
 
 	for _, task := range finished[:len(finished)-maxFinishedTaskHistory] {
 		delete(m.tasks, task.ID)
+	}
+}
+
+func (m *Manager) pruneRunRetention() {
+	if m.runStore == nil || m.config == nil {
+		return
+	}
+	maxAge := time.Duration(m.config.RunRetention.MaxAgeDays) * 24 * time.Hour
+	removed, err := m.runStore.Prune(context.Background(), m.config.RunRetention.MaxRuns, maxAge)
+	if err != nil {
+		slog.Error("清理运行记录失败", "error", err)
+		return
+	}
+	if removed > 0 {
+		slog.Info("已清理旧运行记录", "removed", removed)
 	}
 }
 

@@ -21,12 +21,49 @@ export interface TaskStatusResponse {
     error?: string;
 }
 
+export interface AuthStatus {
+    enabled: boolean;
+    requireViewerForRead: boolean;
+    allowLocalAdmin: boolean;
+    pairingAvailable: boolean;
+}
+
+export interface DeviceInfo {
+    id: string;
+    name: string;
+    scope: string;
+    createdAt: string;
+    lastSeenAt?: string;
+    expiresAt?: string;
+    revokedAt?: string;
+}
+
+const DEVICE_TOKEN_KEY = 'pics-manager-device-token';
+
 const apiBaseURL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080/api/v1';
 
 const apiClient = axios.create({
     baseURL: apiBaseURL,
     timeout: 30000,
 });
+
+apiClient.interceptors.request.use(config => {
+    const token = getDeviceToken();
+    if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+});
+
+export const getDeviceToken = (): string => localStorage.getItem(DEVICE_TOKEN_KEY) ?? '';
+
+export const setDeviceToken = (token: string) => {
+    if (token) {
+        localStorage.setItem(DEVICE_TOKEN_KEY, token);
+    } else {
+        localStorage.removeItem(DEVICE_TOKEN_KEY);
+    }
+};
 
 export const resolveApiAssetUrl = (path?: string): string | undefined => {
     if (!path) {
@@ -37,6 +74,31 @@ export const resolveApiAssetUrl = (path?: string): string | undefined => {
     }
     const normalizedBase = apiBaseURL.replace(/\/api\/v1\/?$/, '');
     return `${normalizedBase}${path}`;
+};
+
+const contentDispositionFileName = (header?: string): string => {
+    if (!header) {
+        return '';
+    }
+    const utf8Match = /filename\*=UTF-8''([^;]+)/i.exec(header);
+    if (utf8Match?.[1]) {
+        return decodeURIComponent(utf8Match[1]);
+    }
+    const match = /filename="?([^";]+)"?/i.exec(header);
+    return match?.[1] ?? '';
+};
+
+export const downloadApiFile = async (path: string, fallbackName: string) => {
+    const response = await apiClient.get(path, { responseType: 'blob', timeout: 120000 });
+    const fileName = contentDispositionFileName(response.headers['content-disposition']) || fallbackName || 'download';
+    const url = window.URL.createObjectURL(response.data);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
 };
 
 const getErrorMessage = (err: unknown, fallback: string): string => {
@@ -142,6 +204,17 @@ export const searchByImage = async (file: File): Promise<SeriesListResponse> => 
 
 export const getConfig = async (): Promise<AppConfig> => {
     return requestData(apiClient.get<ApiEnvelope<AppConfig>>('/config'), '无法加载配置');
+};
+
+export const getAuthStatus = async (): Promise<AuthStatus> => {
+    return requestData(apiClient.get<ApiEnvelope<AuthStatus>>('/auth/status'), '无法加载认证状态');
+};
+
+export const claimPairingCode = async (code: string, deviceName: string): Promise<{ token: string; device: DeviceInfo }> => {
+    return requestData(
+        apiClient.post<ApiEnvelope<{ token: string; device: DeviceInfo }>>('/auth/claim', { code, deviceName }),
+        '设备配对失败',
+    );
 };
 
 export const updateConfig = async (config: AppConfig): Promise<AppConfig> => {

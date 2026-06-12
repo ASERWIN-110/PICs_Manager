@@ -755,6 +755,16 @@ func mediaFilesInDir(dir string, scannerCfg config.ScannerConfig) ([]string, err
 		if walkErr != nil {
 			return walkErr
 		}
+		allowed, allowErr := allowFilesystemEntry(dir, path, entry, scannerCfg.FollowSymlinks)
+		if allowErr != nil {
+			return allowErr
+		}
+		if !allowed {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if entry.IsDir() {
 			return nil
 		}
@@ -782,6 +792,16 @@ func discoverFinalSeriesPaths(ctx context.Context, finalLibraryPath string, scan
 		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		allowed, allowErr := allowFilesystemEntry(finalLibraryPath, path, entry, scannerCfg.FollowSymlinks)
+		if allowErr != nil {
+			return allowErr
+		}
+		if !allowed {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if !entry.IsDir() {
 			return nil
@@ -820,6 +840,13 @@ func directMediaFilesInDir(dir string, scannerCfg config.ScannerConfig) ([]strin
 	}
 	files := make([]string, 0)
 	for _, entry := range entries {
+		allowed, allowErr := allowFilesystemEntry(dir, filepath.Join(dir, entry.Name()), entry, scannerCfg.FollowSymlinks)
+		if allowErr != nil {
+			return nil, allowErr
+		}
+		if !allowed {
+			continue
+		}
 		if entry.IsDir() {
 			continue
 		}

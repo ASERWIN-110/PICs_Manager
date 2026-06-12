@@ -8,6 +8,25 @@ export interface AppConfig {
     server: {
         port: string;
         timeout: string;
+        maintenanceToken?: string;
+    };
+    security: {
+        enabled: boolean;
+        storePath: string;
+        defaultPairingTTL: string;
+        allowLocalAdmin: boolean;
+        corsAllowedOrigins: string[];
+        requireViewerForRead: boolean;
+    };
+    scheduler: {
+        enabled: boolean;
+        interval: string;
+        mode: string;
+        runOnStartup: boolean;
+    };
+    runRetention: {
+        maxRuns: number;
+        maxAgeDays: number;
     };
     database: {
         uri: string;
@@ -29,6 +48,10 @@ export interface AppConfig {
         duplicatesDir: string;
         workerCount: number;
         batchSize: number;
+        ioThrottleMs: number;
+        maintenanceWindow: string;
+        maxFilesPerDir: number;
+        followSymlinks: boolean;
         filePatterns: string[];
         mediaTypes: MediaTypeConfig[];
         seriesGroupPatterns: Array<{

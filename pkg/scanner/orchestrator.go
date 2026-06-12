@@ -93,7 +93,7 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 		}
 	}
 
-	preprocessor, err := NewPreprocessor(o.logDir, cfg.WorkerCount, recorder)
+	preprocessor, err := NewPreprocessorWithSymlinkPolicy(o.logDir, cfg.WorkerCount, cfg.FollowSymlinks, recorder)
 	if err != nil {
 		return fmt.Errorf("创建预处理器失败: %w", err)
 	}

@@ -39,9 +39,31 @@ type ScannerConfig struct {
 	IOThrottleMs      int               `mapstructure:"ioThrottleMs" json:"ioThrottleMs" yaml:"ioThrottleMs"`
 	MaintenanceWindow string            `mapstructure:"maintenanceWindow" json:"maintenanceWindow" yaml:"maintenanceWindow"`
 	MaxFilesPerDir    int               `mapstructure:"maxFilesPerDir" json:"maxFilesPerDir" yaml:"maxFilesPerDir"`
+	FollowSymlinks    bool              `mapstructure:"followSymlinks" json:"followSymlinks" yaml:"followSymlinks"`
 	FilePatterns      []string          `mapstructure:"filePatterns" json:"filePatterns" yaml:"filePatterns"`
 	MediaTypes        []MediaTypeConfig `mapstructure:"mediaTypes" json:"mediaTypes" yaml:"mediaTypes"`
 	SeriesGroupRules  []SeriesGroupRule `mapstructure:"seriesGroupPatterns" json:"seriesGroupPatterns" yaml:"seriesGroupPatterns"`
+}
+
+type SecurityConfig struct {
+	Enabled              bool     `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	StorePath            string   `mapstructure:"storePath" json:"storePath" yaml:"storePath"`
+	DefaultPairingTTL    string   `mapstructure:"defaultPairingTTL" json:"defaultPairingTTL" yaml:"defaultPairingTTL"`
+	AllowLocalAdmin      bool     `mapstructure:"allowLocalAdmin" json:"allowLocalAdmin" yaml:"allowLocalAdmin"`
+	CORSAllowedOrigins   []string `mapstructure:"corsAllowedOrigins" json:"corsAllowedOrigins" yaml:"corsAllowedOrigins"`
+	RequireViewerForRead bool     `mapstructure:"requireViewerForRead" json:"requireViewerForRead" yaml:"requireViewerForRead"`
+}
+
+type SchedulerConfig struct {
+	Enabled      bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	Interval     string `mapstructure:"interval" json:"interval" yaml:"interval"`
+	Mode         string `mapstructure:"mode" json:"mode" yaml:"mode"`
+	RunOnStartup bool   `mapstructure:"runOnStartup" json:"runOnStartup" yaml:"runOnStartup"`
+}
+
+type RunRetentionConfig struct {
+	MaxRuns    int `mapstructure:"maxRuns" json:"maxRuns" yaml:"maxRuns"`
+	MaxAgeDays int `mapstructure:"maxAgeDays" json:"maxAgeDays" yaml:"maxAgeDays"`
 }
 
 type ServerConfig struct {
@@ -121,10 +143,13 @@ type LoggerConfig struct {
 }
 
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server" json:"server" yaml:"server"`
-	Database DatabaseConfig `mapstructure:"database" json:"database" yaml:"database"`
-	Logger   LoggerConfig   `mapstructure:"logger" json:"logger" yaml:"logger"`
-	Scanner  ScannerConfig  `mapstructure:"scanner" json:"scanner" yaml:"scanner"`
+	Server       ServerConfig       `mapstructure:"server" json:"server" yaml:"server"`
+	Security     SecurityConfig     `mapstructure:"security" json:"security" yaml:"security"`
+	Scheduler    SchedulerConfig    `mapstructure:"scheduler" json:"scheduler" yaml:"scheduler"`
+	RunRetention RunRetentionConfig `mapstructure:"runRetention" json:"runRetention" yaml:"runRetention"`
+	Database     DatabaseConfig     `mapstructure:"database" json:"database" yaml:"database"`
+	Logger       LoggerConfig       `mapstructure:"logger" json:"logger" yaml:"logger"`
+	Scanner      ScannerConfig      `mapstructure:"scanner" json:"scanner" yaml:"scanner"`
 }
 
 var C *Config
@@ -230,6 +255,20 @@ func firstEnv(keys ...string) string {
 	return ""
 }
 
+func SecurityStorePath(cfg *Config) string {
+	if cfg == nil {
+		return ""
+	}
+	if path := strings.TrimSpace(cfg.Security.StorePath); path != "" {
+		return path
+	}
+	logRoot := strings.TrimSpace(cfg.Logger.Path)
+	if logRoot == "" {
+		logRoot = "."
+	}
+	return logRoot + string(os.PathSeparator) + "auth" + string(os.PathSeparator) + "devices.json"
+}
+
 func withMongoCredentials(rawURI, username, password, authSource string) string {
 	if strings.TrimSpace(rawURI) == "" {
 		rawURI = "mongodb://localhost:27017"
@@ -275,10 +314,30 @@ func ValidateConfig(cfg Config) error {
 	if cfg.Scanner.MaxFilesPerDir < 0 {
 		return fmt.Errorf("scanner.maxFilesPerDir must be >= 0, got %d", cfg.Scanner.MaxFilesPerDir)
 	}
+	if cfg.RunRetention.MaxRuns < 0 {
+		return fmt.Errorf("runRetention.maxRuns must be >= 0, got %d", cfg.RunRetention.MaxRuns)
+	}
+	if cfg.RunRetention.MaxAgeDays < 0 {
+		return fmt.Errorf("runRetention.maxAgeDays must be >= 0, got %d", cfg.RunRetention.MaxAgeDays)
+	}
 	if strings.TrimSpace(cfg.Scanner.MaintenanceWindow) != "" {
 		if err := validateMaintenanceWindow(cfg.Scanner.MaintenanceWindow); err != nil {
 			return err
 		}
+	}
+	if strings.TrimSpace(cfg.Security.DefaultPairingTTL) != "" {
+		if _, err := time.ParseDuration(cfg.Security.DefaultPairingTTL); err != nil {
+			return fmt.Errorf("security.defaultPairingTTL must be a duration, got %q: %w", cfg.Security.DefaultPairingTTL, err)
+		}
+	}
+	if strings.TrimSpace(cfg.Scheduler.Interval) != "" {
+		if _, err := time.ParseDuration(cfg.Scheduler.Interval); err != nil {
+			return fmt.Errorf("scheduler.interval must be a duration, got %q: %w", cfg.Scheduler.Interval, err)
+		}
+	}
+	schedulerMode := strings.TrimSpace(cfg.Scheduler.Mode)
+	if schedulerMode != "" && schedulerMode != "full" && schedulerMode != "classifyOnly" {
+		return fmt.Errorf("scheduler.mode must be full or classifyOnly, got %q", cfg.Scheduler.Mode)
 	}
 	for _, pattern := range cfg.Scanner.FilePatterns {
 		if _, err := regexp.Compile(pattern); err != nil {

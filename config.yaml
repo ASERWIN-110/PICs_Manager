@@ -1,9 +1,33 @@
 server:
   port: ":8080"
   timeout: 30s
-  # 可选：设置后，POST/DELETE /api/v1/tasks 和 PUT /api/v1/config 需要维护 token。
-  # 支持 Authorization: Bearer <token> 或 X-Maintenance-Token: <token>。
+  # 兼容旧版维护 token。新部署建议使用 security 设备绑定。
   maintenanceToken: ""
+
+security:
+  # NAS 长期运行建议开启。开启后可用 pics-cli -action create-pairing-code 生成一次性配对码。
+  enabled: false
+  # 留空时使用 <logger.path>/auth/devices.json。文件里只保存 token 哈希，不保存明文 token。
+  storePath: ""
+  defaultPairingTTL: "24h"
+  # true 表示查看、搜索、缩略图、下载都需要 viewer/maintainer/admin token。
+  requireViewerForRead: true
+  # true 表示本机请求可无 token 修改完整配置；远程请求即使 admin token 也不能改数据库、日志和关键路径。
+  allowLocalAdmin: true
+  # 留空时使用本地开发默认值；生产反代可配置固定 origin。
+  corsAllowedOrigins: []
+
+scheduler:
+  enabled: false
+  interval: "6h"
+  mode: "full"
+  runOnStartup: false
+
+runRetention:
+  # 0 表示不按数量清理。
+  maxRuns: 200
+  # 0 表示不按天数清理。
+  maxAgeDays: 90
 
 database:
   uri: "mongodb://localhost:27017"
@@ -54,6 +78,8 @@ scanner:
   maintenanceWindow: ""
   # 目录健康报告阈值。0 表示不报警。
   maxFilesPerDir: 5000
+  # 默认跳过 symlink。开启后会解析真实路径，并要求仍在扫描根/最终库内部。
+  followSymlinks: false
   
   # --- 用于“文件分类”的严格规则 (从文件名提取系列名) ---
   filePatterns:

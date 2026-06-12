@@ -9,6 +9,7 @@ import (
 	"PICs_Manager/pkg/logger"
 	"PICs_Manager/pkg/runstate"
 	"PICs_Manager/pkg/scanner"
+	"PICs_Manager/pkg/security"
 	"context"
 	"errors"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -72,9 +74,27 @@ func main() {
 		slog.Error("FATAL: 无法恢复运行状态", "error", err)
 		os.Exit(1)
 	}
+	if removed, err := runStore.Prune(appCtx, config.C.RunRetention.MaxRuns, time.Duration(config.C.RunRetention.MaxAgeDays)*24*time.Hour); err != nil {
+		_ = db.Close(context.Background())
+		slog.Error("FATAL: 无法清理旧运行状态", "error", err)
+		os.Exit(1)
+	} else if removed > 0 {
+		slog.Info("已清理旧运行状态", "removed", removed)
+	}
 	slog.Info("任务管理器创建成功")
 
-	router := api.RegisterRoutesWithRunStore(taskManager, db, runStore)
+	var authStore *security.Store
+	if config.C.Security.Enabled {
+		authStore, err = security.NewStore(config.SecurityStorePath(config.C))
+		if err != nil {
+			_ = db.Close(context.Background())
+			slog.Error("FATAL: 无法初始化设备绑定存储", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("设备绑定已启用", "store", config.SecurityStorePath(config.C), "requireViewerForRead", config.C.Security.RequireViewerForRead)
+	}
+
+	router := api.RegisterRoutesWithServices(taskManager, db, runStore, authStore)
 
 	server := &http.Server{
 		Addr:         config.C.Server.Port,
@@ -89,6 +109,7 @@ func main() {
 	go func() {
 		serverErr <- server.ListenAndServe()
 	}()
+	startScheduler(appCtx, taskManager)
 
 	select {
 	case err := <-serverErr:
@@ -113,4 +134,63 @@ func main() {
 			slog.Error("HTTP服务器关闭时返回错误", "error", err)
 		}
 	}
+}
+
+func startScheduler(ctx context.Context, taskManager *task.Manager) {
+	if config.C == nil || taskManager == nil || !config.C.Scheduler.Enabled {
+		return
+	}
+	interval, err := time.ParseDuration(config.C.Scheduler.Interval)
+	if err != nil || interval <= 0 {
+		slog.Error("调度器未启动：scheduler.interval 无效", "interval", config.C.Scheduler.Interval, "error", err)
+		return
+	}
+	mode := strings.TrimSpace(config.C.Scheduler.Mode)
+	if mode == "" {
+		mode = strings.TrimSpace(config.C.Scanner.Mode)
+	}
+	if mode == "" {
+		mode = "full"
+	}
+	slog.Info("调度器已启动", "interval", interval, "mode", mode, "runOnStartup", config.C.Scheduler.RunOnStartup)
+	go func() {
+		if config.C.Scheduler.RunOnStartup {
+			startScheduledScan(taskManager, mode)
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				startScheduledScan(taskManager, mode)
+			}
+		}
+	}()
+}
+
+func startScheduledScan(taskManager *task.Manager, fallbackMode string) {
+	if config.C == nil {
+		return
+	}
+	mode := strings.TrimSpace(config.C.Scheduler.Mode)
+	if mode == "" {
+		mode = fallbackMode
+	}
+	path := strings.TrimSpace(config.C.Scanner.ScanPath)
+	if path == "" {
+		slog.Warn("跳过调度扫描：scanner.scanPath 为空")
+		return
+	}
+	taskID, err := taskManager.StartNewScanTask(path, mode)
+	if err != nil {
+		if errors.Is(err, task.ErrTaskConflict) {
+			slog.Info("跳过调度扫描：已有维护任务运行", "error", err)
+			return
+		}
+		slog.Error("启动调度扫描失败", "error", err)
+		return
+	}
+	slog.Info("调度扫描已启动", "taskID", taskID, "path", path, "mode", mode)
 }

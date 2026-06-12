@@ -8,6 +8,9 @@ import (
 	"PICs_Manager/pkg/database"
 	"PICs_Manager/pkg/hasher"
 	"PICs_Manager/pkg/runstate"
+	"PICs_Manager/pkg/security"
+	"archive/zip"
+	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +18,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,6 +40,7 @@ type APIHandlers struct {
 	taskManager *task.Manager
 	db          database.Store
 	runs        *runstate.Store
+	authStore   *security.Store
 	configPath  string
 }
 
@@ -44,33 +50,96 @@ func NewAPIHandlersWithRunStore(tm *task.Manager, db database.Store, runStores .
 	if len(runStores) > 0 {
 		runs = runStores[0]
 	}
+	return NewAPIHandlersWithServices(tm, db, runs, nil)
+}
+
+func NewAPIHandlersWithServices(tm *task.Manager, db database.Store, runs *runstate.Store, authStore *security.Store) *APIHandlers {
 	return &APIHandlers{
 		taskManager: tm,
 		db:          db,
 		runs:        runs,
+		authStore:   authStore,
 		configPath:  "config.yaml",
 	}
 }
 
 func (h *APIHandlers) RequireMaintenanceAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return h.RequireScope(security.ScopeMaintainer)(next)
+}
+
+func (h *APIHandlers) RequireScope(required security.Scope) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if h.allowUnauthenticated(required, r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			token := requestMaintenanceToken(r)
+			if h.legacyTokenAllowed(token, required) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if h.authStore == nil {
+				respondError(w, http.StatusUnauthorized, "auth_required", "接口需要有效设备 token")
+				return
+			}
+			if _, err := h.authStore.Authenticate(r.Context(), token, required); err != nil {
+				if errors.Is(err, security.ErrForbidden) {
+					respondError(w, http.StatusForbidden, "insufficient_scope", "设备权限不足")
+					return
+				}
+				respondError(w, http.StatusUnauthorized, "auth_required", "接口需要有效设备 token")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func (h *APIHandlers) allowUnauthenticated(required security.Scope, r *http.Request) bool {
+	if config.C == nil || !config.C.Security.Enabled {
 		token := ""
 		if config.C != nil {
 			token = strings.TrimSpace(config.C.Server.MaintenanceToken)
 		}
-		if token == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(requestMaintenanceToken(r))) != 1 {
-			respondError(w, http.StatusUnauthorized, "maintenance_auth_required", "维护接口需要有效 token")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+		return token == ""
+	}
+	if required == security.ScopeViewer && !config.C.Security.RequireViewerForRead {
+		return true
+	}
+	if required == security.ScopeAdmin && config.C.Security.AllowLocalAdmin && isLocalRequest(r) {
+		return true
+	}
+	return false
+}
+
+func (h *APIHandlers) legacyTokenAllowed(token string, required security.Scope) bool {
+	if config.C == nil {
+		return false
+	}
+	legacy := strings.TrimSpace(config.C.Server.MaintenanceToken)
+	if legacy == "" || token == "" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(legacy), []byte(token)) != 1 {
+		return false
+	}
+	return security.HasScope(security.ScopeAdmin, required)
+}
+
+func isLocalRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func requestMaintenanceToken(r *http.Request) string {
+	if value := strings.TrimSpace(r.Header.Get("X-Device-Token")); value != "" {
+		return value
+	}
 	if value := strings.TrimSpace(r.Header.Get("X-Maintenance-Token")); value != "" {
 		return value
 	}
@@ -127,6 +196,18 @@ type mediaResponse struct {
 	ThumbnailURL   string             `json:"thumbnailUrl,omitempty"`
 	CreatedAt      interface{}        `json:"createdAt"`
 	UpdatedAt      interface{}        `json:"updatedAt"`
+}
+
+type authStatusResponse struct {
+	Enabled              bool `json:"enabled"`
+	RequireViewerForRead bool `json:"requireViewerForRead"`
+	AllowLocalAdmin      bool `json:"allowLocalAdmin"`
+	PairingAvailable     bool `json:"pairingAvailable"`
+}
+
+type claimPairingResponse struct {
+	Token  string          `json:"token"`
+	Device security.Device `json:"device"`
 }
 
 func toSeriesResponses(items []models.Series) []seriesResponse {
@@ -260,6 +341,44 @@ func makeCursorPagination(page, limit int, total int64, nextCursor string) pagin
 	return pagination
 }
 
+// --- 认证处理器 ---
+
+func (h *APIHandlers) HandleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	status := authStatusResponse{}
+	if config.C != nil {
+		status.Enabled = config.C.Security.Enabled
+		status.RequireViewerForRead = config.C.Security.RequireViewerForRead
+		status.AllowLocalAdmin = config.C.Security.AllowLocalAdmin
+	}
+	status.PairingAvailable = h.authStore != nil
+	respondJSON(w, http.StatusOK, status)
+}
+
+func (h *APIHandlers) HandleClaimPairingCode(w http.ResponseWriter, r *http.Request) {
+	if h.authStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "pairing_unavailable", "设备配对未启用")
+		return
+	}
+	var payload struct {
+		Code       string `json:"code"`
+		DeviceName string `json:"deviceName"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid_request_body", "无效的请求体: "+err.Error())
+		return
+	}
+	token, device, err := h.authStore.ClaimPairingCode(r.Context(), payload.Code, payload.DeviceName)
+	if err != nil {
+		if errors.Is(err, security.ErrUnauthorized) {
+			respondError(w, http.StatusUnauthorized, "invalid_pairing_code", "配对码无效、过期或已使用")
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "pairing_failed", "设备配对失败: "+err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, claimPairingResponse{Token: token, Device: device})
+}
+
 // --- 任务处理器 ---
 
 func (h *APIHandlers) HandleStartScanTask(w http.ResponseWriter, r *http.Request) {
@@ -273,6 +392,13 @@ func (h *APIHandlers) HandleStartScanTask(w http.ResponseWriter, r *http.Request
 	}
 	payload.Path = strings.TrimSpace(payload.Path)
 	payload.Mode = strings.TrimSpace(payload.Mode)
+	if remoteRestrictedMaintenance(r) {
+		if config.C == nil || strings.TrimSpace(config.C.Scanner.ScanPath) == "" {
+			respondError(w, http.StatusBadRequest, "missing_configured_scan_path", "安全模式下远程维护只能使用配置中的 scanPath")
+			return
+		}
+		payload.Path = strings.TrimSpace(config.C.Scanner.ScanPath)
+	}
 	if payload.Path == "" {
 		respondError(w, http.StatusBadRequest, "missing_path", "缺少 'path' 字段")
 		return
@@ -528,6 +654,240 @@ func serveThumbnail(w http.ResponseWriter, thumbnail string) {
 	_, _ = w.Write(data)
 }
 
+func (h *APIHandlers) HandleMediaDownload(w http.ResponseWriter, r *http.Request) {
+	mediaID, err := primitive.ObjectIDFromHex(chi.URLParam(r, "mediaId"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid_media_id", "无效的媒体ID")
+		return
+	}
+	if !h.requireDB(w) {
+		return
+	}
+	media, err := h.db.Images().GetByID(r.Context(), mediaID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "media_lookup_failed", "获取媒体失败: "+err.Error())
+		return
+	}
+	if media == nil {
+		respondError(w, http.StatusNotFound, "media_not_found", "媒体不存在")
+		return
+	}
+	filePath, err := safeLibraryPath(media.FilePath)
+	if err != nil {
+		respondError(w, http.StatusForbidden, "unsafe_media_path", err.Error())
+		return
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "media_file_not_found", "媒体文件不存在: "+err.Error())
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "media_file_stat_failed", "读取媒体文件状态失败: "+err.Error())
+		return
+	}
+	if info.IsDir() {
+		respondError(w, http.StatusBadRequest, "media_path_is_directory", "媒体路径是目录")
+		return
+	}
+	setAttachmentHeader(w, media.FileName)
+	http.ServeContent(w, r, media.FileName, info.ModTime(), file)
+}
+
+func (h *APIHandlers) HandleSeriesDownload(w http.ResponseWriter, r *http.Request) {
+	seriesID, err := primitive.ObjectIDFromHex(chi.URLParam(r, "seriesId"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid_series_id", "无效的系列ID")
+		return
+	}
+	if !h.requireDB(w) {
+		return
+	}
+	series, err := h.db.Series().GetByID(r.Context(), seriesID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "series_lookup_failed", "获取系列失败: "+err.Error())
+		return
+	}
+	if series == nil {
+		respondError(w, http.StatusNotFound, "series_not_found", "系列不存在")
+		return
+	}
+	dirPath, err := safeLibraryPath(series.Path)
+	if err != nil {
+		respondError(w, http.StatusForbidden, "unsafe_series_path", err.Error())
+		return
+	}
+	info, err := os.Stat(dirPath)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "series_path_not_found", "系列目录不存在: "+err.Error())
+		return
+	}
+	if !info.IsDir() {
+		respondError(w, http.StatusBadRequest, "series_path_not_directory", "系列路径不是目录")
+		return
+	}
+
+	archiveName := safeDownloadName(series.Name)
+	if archiveName == "" {
+		archiveName = series.ID.Hex()
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	setAttachmentHeader(w, archiveName+".zip")
+	zipWriter := zip.NewWriter(w)
+	defer zipWriter.Close()
+	if err := writeSeriesZip(r.Context(), zipWriter, dirPath, archiveName); err != nil {
+		// Headers may already be written; log the error in-band for clients that
+		// inspect the broken archive and return to stop writing more entries.
+		_, _ = zipWriter.Create("ERROR.txt")
+		return
+	}
+}
+
+func safeLibraryPath(rawPath string) (string, error) {
+	if config.C == nil {
+		return "", errors.New("配置未初始化")
+	}
+	if strings.TrimSpace(config.C.Scanner.FinalLibraryPath) == "" {
+		return "", errors.New("finalLibraryPath 未配置")
+	}
+	root, err := filepath.Abs(config.C.Scanner.FinalLibraryPath)
+	if err != nil {
+		return "", fmt.Errorf("无法解析最终库路径: %w", err)
+	}
+	candidate, err := filepath.Abs(rawPath)
+	if err != nil {
+		return "", fmt.Errorf("无法解析媒体路径: %w", err)
+	}
+	if err := requirePathInside(root, candidate); err != nil {
+		return "", err
+	}
+	if !config.C.Scanner.FollowSymlinks {
+		if err := rejectSymlinkComponents(root, candidate); err != nil {
+			return "", err
+		}
+		return candidate, nil
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("无法解析最终库真实路径: %w", err)
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", fmt.Errorf("无法解析媒体真实路径: %w", err)
+	}
+	if err := requirePathInside(resolvedRoot, resolvedCandidate); err != nil {
+		return "", err
+	}
+	return resolvedCandidate, nil
+}
+
+func requirePathInside(root, candidate string) error {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return fmt.Errorf("无法校验路径边界: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("路径不在最终库内: %s", candidate)
+	}
+	return nil
+}
+
+func rejectSymlinkComponents(root, candidate string) error {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return err
+	}
+	current := root
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("路径包含 symlink，已按配置拒绝: %s", current)
+		}
+	}
+	return nil
+}
+
+func setAttachmentHeader(w http.ResponseWriter, fileName string) {
+	fileName = safeDownloadName(fileName)
+	if fileName == "" {
+		fileName = "download"
+	}
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": fileName}))
+}
+
+func safeDownloadName(name string) string {
+	name = filepath.Base(strings.TrimSpace(name))
+	name = strings.Trim(name, ". ")
+	replacer := strings.NewReplacer("/", "_", "\\", "_", "\x00", "_")
+	return replacer.Replace(name)
+}
+
+func writeSeriesZip(ctx context.Context, zipWriter *zip.Writer, dirPath string, archiveName string) error {
+	return filepath.WalkDir(dirPath, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if path == dirPath {
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if config.C == nil || !config.C.Scanner.FollowSymlinks {
+				return nil
+			}
+		}
+		sourcePath, err := safeLibraryPath(path)
+		if err != nil {
+			return err
+		}
+		info, err := os.Stat(sourcePath)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dirPath, path)
+		if err != nil {
+			return err
+		}
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(filepath.Join(archiveName, rel))
+		header.Method = zip.Deflate
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		file, err := os.Open(sourcePath)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(writer, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+}
+
 // --- 搜索处理器 ---
 
 func (h *APIHandlers) HandleSearchText(w http.ResponseWriter, r *http.Request) {
@@ -679,6 +1039,9 @@ func (h *APIHandlers) HandleUpdateConfig(w http.ResponseWriter, r *http.Request)
 	}
 
 	runtimeConfig := newConfig
+	if shouldPreserveLocalOnlyConfig(r) && config.C != nil {
+		preserveLocalOnlyConfig(&runtimeConfig, config.C)
+	}
 	if isRedactedURI(runtimeConfig.Database.URI) && config.C != nil {
 		runtimeConfig.Database.URI = config.C.Database.URI
 	}
@@ -713,6 +1076,31 @@ func (h *APIHandlers) HandleUpdateConfig(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondJSON(w, http.StatusOK, safeConfigForResponse(config.C))
+}
+
+func shouldPreserveLocalOnlyConfig(r *http.Request) bool {
+	if config.C == nil || !config.C.Security.Enabled {
+		return false
+	}
+	return !isLocalRequest(r)
+}
+
+func remoteRestrictedMaintenance(r *http.Request) bool {
+	return shouldPreserveLocalOnlyConfig(r)
+}
+
+func preserveLocalOnlyConfig(next *config.Config, current *config.Config) {
+	next.Database = current.Database
+	next.Logger = current.Logger
+	next.Server.Port = current.Server.Port
+	next.Server.Timeout = current.Server.Timeout
+	next.Scanner.ScanPath = current.Scanner.ScanPath
+	next.Scanner.StagingPath = current.Scanner.StagingPath
+	next.Scanner.FinalLibraryPath = current.Scanner.FinalLibraryPath
+	next.Scanner.BackupPath = current.Scanner.BackupPath
+	next.Scanner.QuarantinePath = current.Scanner.QuarantinePath
+	next.Scanner.CorruptionLogPath = current.Scanner.CorruptionLogPath
+	next.Scanner.DuplicatesDir = current.Scanner.DuplicatesDir
 }
 
 func safeConfigForResponse(cfg *config.Config) *config.Config {

@@ -101,6 +101,16 @@ func CountUnsupportedFiles(ctx context.Context, root string, scannerCfg config.S
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		allowed, allowErr := allowFilesystemEntry(root, path, d, scannerCfg.FollowSymlinks)
+		if allowErr != nil {
+			return allowErr
+		}
+		if !allowed {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if d.IsDir() {
 			if path != root && isIgnoredFilesystemEntry(d.Name()) {
 				return filepath.SkipDir

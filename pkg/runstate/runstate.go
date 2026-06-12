@@ -146,6 +146,44 @@ func (s *Store) List(ctx context.Context, limit int) ([]Run, error) {
 	return runs, nil
 }
 
+func (s *Store) Prune(ctx context.Context, maxRuns int, maxAge time.Duration) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if maxRuns <= 0 && maxAge <= 0 {
+		return 0, nil
+	}
+	runs, err := s.List(ctx, 0)
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Time{}
+	if maxAge > 0 {
+		cutoff = time.Now().Add(-maxAge)
+	}
+	terminalSeen := 0
+	removed := 0
+	for _, run := range runs {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		if isUnfinishedStatus(run.Status) {
+			continue
+		}
+		terminalSeen++
+		removeByCount := maxRuns > 0 && terminalSeen > maxRuns
+		removeByAge := !cutoff.IsZero() && run.StartedAt.Before(cutoff)
+		if !removeByCount && !removeByAge {
+			continue
+		}
+		if err := s.removeRunFiles(run.ID); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 func (s *Store) Update(ctx context.Context, id string, mutate func(*Run)) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -312,6 +350,16 @@ func (s *Store) runPath(id string) string {
 
 func (s *Store) journalPath(id string) string {
 	return filepath.Join(s.dir, safeFileName(id)+".journal.jsonl")
+}
+
+func (s *Store) removeRunFiles(id string) error {
+	if err := os.Remove(s.runPath(id)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(s.journalPath(id)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) getUnlocked(id string) (*Run, error) {

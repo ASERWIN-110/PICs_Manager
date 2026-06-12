@@ -6,6 +6,7 @@ import (
 	"PICs_Manager/internal/task"
 	"PICs_Manager/pkg/database"
 	"PICs_Manager/pkg/runstate"
+	"PICs_Manager/pkg/security"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -77,6 +78,88 @@ func TestMaintenanceRoutesRequireTokenWhenConfigured(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("expected accepted maintenance request, got %d body=%s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestDevicePairingAndScopeAuth(t *testing.T) {
+	oldConfig := config.C
+	config.C = &config.Config{
+		Scanner:  config.ScannerConfig{ScanPath: "/tmp/media"},
+		Security: config.SecurityConfig{Enabled: true, RequireViewerForRead: true},
+	}
+	defer func() { config.C = oldConfig }()
+
+	authStore, err := security.NewStore(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	viewerCode, _, err := authStore.CreatePairingCode(context.Background(), "viewer-phone", security.ScopeViewer, time.Hour)
+	if err != nil {
+		t.Fatalf("CreatePairingCode viewer returned error: %v", err)
+	}
+	maintainerCode, _, err := authStore.CreatePairingCode(context.Background(), "maintainer-laptop", security.ScopeMaintainer, time.Hour)
+	if err != nil {
+		t.Fatalf("CreatePairingCode maintainer returned error: %v", err)
+	}
+	router := RegisterRoutesWithServices(
+		task.NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, config.C),
+		nil,
+		nil,
+		authStore,
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/series", nil)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected viewer route to require token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	viewerToken := claimToken(t, router, viewerCode, "viewer-phone")
+	maintainerToken := claimToken(t, router, maintainerCode, "maintainer-laptop")
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks", strings.NewReader(`{"path":"/tmp/media","mode":"classifyOnly"}`))
+	req.Header.Set("Authorization", "Bearer "+viewerToken)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected viewer token to be forbidden for maintenance, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks", strings.NewReader(`{"path":"/tmp/media","mode":"classifyOnly"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+maintainerToken)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected maintainer token to start task, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func claimToken(t *testing.T, router http.Handler, code, deviceName string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{"code": code, "deviceName": deviceName})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/claim", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("claim expected status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("Unmarshal claim response returned error: %v", err)
+	}
+	if envelope.Data.Token == "" {
+		t.Fatalf("claim response missing token: %s", rec.Body.String())
+	}
+	return envelope.Data.Token
 }
 
 func TestSafeConfigRedactsMaintenanceToken(t *testing.T) {
@@ -275,6 +358,57 @@ func TestListMediaBySeriesSeparatesMediaTypes(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"mediaType":"image"`) {
 		t.Fatalf("expected image response, got %s", rec.Body.String())
+	}
+}
+
+func TestMediaDownloadSupportsRangeAndRejectsOutsideLibrary(t *testing.T) {
+	oldConfig := config.C
+	t.Cleanup(func() { config.C = oldConfig })
+
+	root := t.TempDir()
+	library := filepath.Join(root, "library")
+	if err := os.MkdirAll(library, 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	mediaID := primitive.NewObjectID()
+	mediaPath := filepath.Join(library, "sample.txt")
+	if err := os.WriteFile(mediaPath, []byte("0123456789"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	config.C = &config.Config{Scanner: config.ScannerConfig{FinalLibraryPath: library}}
+
+	router := RegisterRoutesWithRunStore(nil, apiDownloadStore{media: &models.Image{
+		ID:       mediaID,
+		FileName: "sample.txt",
+		FilePath: mediaPath,
+	}})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/media/"+mediaID.Hex()+"/download", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusPartialContent, rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "2345" {
+		t.Fatalf("expected ranged body %q, got %q", "2345", got)
+	}
+
+	outsidePath := filepath.Join(root, "outside.txt")
+	if err := os.WriteFile(outsidePath, []byte("outside"), 0o644); err != nil {
+		t.Fatalf("WriteFile outside returned error: %v", err)
+	}
+	router = RegisterRoutesWithRunStore(nil, apiDownloadStore{media: &models.Image{
+		ID:       mediaID,
+		FileName: "outside.txt",
+		FilePath: outsidePath,
+	}})
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/media/"+mediaID.Hex()+"/download", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected status %d for outside file, got %d: %s", http.StatusForbidden, rec.Code, rec.Body.String())
 	}
 }
 
@@ -530,6 +664,37 @@ func TestHandleStartScanTaskReturnsBadRequestForInvalidMode(t *testing.T) {
 	}
 	if envelope.Error == nil || envelope.Error.Code != "invalid_task" {
 		t.Fatalf("unexpected error envelope: %+v", envelope.Error)
+	}
+}
+
+func TestHandleStartScanTaskUsesConfiguredPathForRemoteSecureRequests(t *testing.T) {
+	oldConfig := config.C
+	t.Cleanup(func() { config.C = oldConfig })
+
+	cfg := &config.Config{
+		Scanner:  config.ScannerConfig{ScanPath: "/configured/inbox"},
+		Security: config.SecurityConfig{Enabled: true},
+	}
+	config.C = cfg
+	runner := captureRunner{cfgs: make(chan config.ScannerConfig, 1)}
+	handlers := NewAPIHandlersWithRunStore(task.NewManagerWithRunStore(runner, cfg), nil)
+	body := bytes.NewBufferString(`{"path":"/tmp/evil","mode":"classifyOnly"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", body)
+	req.RemoteAddr = "203.0.113.10:12345"
+	rec := httptest.NewRecorder()
+
+	handlers.HandleStartScanTask(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, rec.Code, rec.Body.String())
+	}
+	select {
+	case got := <-runner.cfgs:
+		if got.ScanPath != "/configured/inbox" {
+			t.Fatalf("expected configured scan path, got %q", got.ScanPath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scanner config")
 	}
 }
 
@@ -901,4 +1066,42 @@ func (s apiTypedImageStore) ListBySeriesIDCursor(_ context.Context, seriesID pri
 		FileName:  s.mediaType + "-item",
 		FilePath:  "/library/" + s.mediaType + "-item",
 	}}, 1, "", nil
+}
+
+type apiDownloadStore struct {
+	apiFakeStore
+	media  *models.Image
+	series *models.Series
+}
+
+func (s apiDownloadStore) Images() database.ImageStore {
+	return apiDownloadImageStore{media: s.media}
+}
+
+func (s apiDownloadStore) Series() database.SeriesStore {
+	return apiDownloadSeriesStore{series: s.series}
+}
+
+type apiDownloadImageStore struct {
+	apiFakeImageStore
+	media *models.Image
+}
+
+func (s apiDownloadImageStore) GetByID(_ context.Context, id primitive.ObjectID) (*models.Image, error) {
+	if s.media != nil && s.media.ID == id {
+		return s.media, nil
+	}
+	return nil, nil
+}
+
+type apiDownloadSeriesStore struct {
+	apiFakeSeriesStore
+	series *models.Series
+}
+
+func (s apiDownloadSeriesStore) GetByID(_ context.Context, id primitive.ObjectID) (*models.Series, error) {
+	if s.series != nil && s.series.ID == id {
+		return s.series, nil
+	}
+	return nil, nil
 }

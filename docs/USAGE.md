@@ -55,6 +55,25 @@ scanner:
   ioThrottleMs: 0
   maintenanceWindow: ""
   maxFilesPerDir: 5000
+  followSymlinks: false
+
+security:
+  enabled: false
+  storePath: ""
+  defaultPairingTTL: "24h"
+  requireViewerForRead: true
+  allowLocalAdmin: true
+  corsAllowedOrigins: []
+
+scheduler:
+  enabled: false
+  interval: "6h"
+  mode: "full"
+  runOnStartup: false
+
+runRetention:
+  maxRuns: 200
+  maxAgeDays: 90
 ```
 
 `scanner.mode` 可选值：
@@ -76,8 +95,51 @@ NAS 长期运行相关字段：
 - `ioThrottleMs`：每次分类移动文件前等待的毫秒数。机械盘或低端 NAS 可以设置为 `5`、`10` 这类小值降低 IO 峰值。
 - `maintenanceWindow`：维护时间窗口，格式 `HH:MM-HH:MM`，例如 `01:00-06:00`。留空表示任何时间都允许运行。
 - `maxFilesPerDir`：目录健康报告阈值。单目录文件数超过该值会写入报告 warnings。
+- `followSymlinks`：默认 `false`，扫描和下载都会跳过 symlink。设为 `true` 后会解析真实路径，并要求真实路径仍在扫描根或最终库内。
 
-`server.maintenanceToken` 为空时保持本地兼容；设置后，维护接口需要 `Authorization: Bearer <token>` 或 `X-Maintenance-Token: <token>`。只读查看接口不需要 token。
+`server.maintenanceToken` 是旧版兼容 token。新部署建议使用 `security` 设备绑定。
+
+`scheduler` 可让后端按固定间隔自动触发扫描。调度器和手工 CLI/API 共用 runstate 维护锁，如果已有任务运行，本轮调度会跳过。
+
+`runRetention` 会清理已结束的旧 run 和 journal。`maxRuns: 0` 表示不按数量清理，`maxAgeDays: 0` 表示不按天数清理；未结束的 run 不会被清理。
+
+## 设备绑定和远程访问
+
+开启设备绑定：
+
+```yaml
+security:
+  enabled: true
+  requireViewerForRead: true
+```
+
+生成一次性配对码：
+
+```bash
+go run ./cmd/cli -action create-pairing-code -device-name family-viewer -scope viewer
+go run ./cmd/cli -action create-pairing-code -device-name admin-laptop -scope admin -ttl 2h
+```
+
+打开前端后输入配对码，前端会保存一次性换回的设备 token。服务端只保存 token 哈希，不保存明文 token。
+
+权限级别：
+
+- `viewer`：查看系列、搜索、缩略图和下载。
+- `maintainer`：包含 viewer，并可启动/停止/暂停扫描、查看 run/journal。
+- `admin`：包含 maintainer，并可读取和更新配置。
+
+设备管理：
+
+```bash
+go run ./cmd/cli -action list-devices
+go run ./cmd/cli -action revoke-device -device-id '<deviceId>'
+```
+
+远程安全限制：
+
+- 非本机请求即使带 admin token，也不能修改数据库、日志目录、服务端端口和扫描关键路径。
+- 非本机请求启动扫描时，只能使用配置中的 `scanner.scanPath`，请求体里的任意 path 会被忽略。
+- 本机请求在 `security.allowLocalAdmin: true` 时可用于完整维护配置，适合 SSH 到 NAS 后操作。
 
 ## 媒体类型和分类规则
 
@@ -243,8 +305,12 @@ GET  /api/v1/series/{seriesId}/media/{mediaType}?limit=20&cursor=
 GET  /api/v1/series/{seriesId}/images?limit=20&cursor=      # 兼容接口，只返回图片
 GET  /api/v1/series/{seriesId}/thumbnail
 GET  /api/v1/images/{imageId}/thumbnail
+GET  /api/v1/series/{seriesId}/download
+GET  /api/v1/media/{mediaId}/download
 GET  /api/v1/search/text?q=keyword&limit=20&cursor=
 POST /api/v1/search/image
+GET  /api/v1/auth/status
+POST /api/v1/auth/claim
 GET  /api/v1/config
 PUT  /api/v1/config
 ```
@@ -256,6 +322,17 @@ curl -X POST http://localhost:8080/api/v1/tasks \
   -H 'Content-Type: application/json' \
   -d '{"path":"/path/to/inbox","mode":"classifyOnly"}'
 ```
+
+设备绑定开启后：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H 'Authorization: Bearer <device-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"classifyOnly"}'
+```
+
+下载接口只按数据库 ID 下载，不接受任意路径。单文件下载支持 HTTP Range；系列下载会流式生成 zip。
 
 列表接口返回统一 envelope：
 
@@ -370,8 +447,8 @@ go run ./cmd/verify-scan \
 下载对应平台包后解压：
 
 ```bash
-tar -xzf PICs_Manager_v0.1.2_linux_amd64.tar.gz
-cd PICs_Manager_v0.1.2_linux_amd64
+tar -xzf PICs_Manager_v0.1.3_linux_amd64.tar.gz
+cd PICs_Manager_v0.1.3_linux_amd64
 ```
 
 修改 `config.yaml`，然后运行：

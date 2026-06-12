@@ -8,6 +8,7 @@ import (
 	"PICs_Manager/pkg/maintenance"
 	"PICs_Manager/pkg/runstate"
 	"PICs_Manager/pkg/scanner"
+	"PICs_Manager/pkg/security"
 	"context"
 	"flag"
 	"fmt"
@@ -23,10 +24,14 @@ import (
 )
 
 func main() {
-	action := flag.String("action", "", "操作: scan, create-manifest, health-report, dump-database, rebuild-database, list-series, list-media, search, stats, list-runs, show-run, run-journal, verify-run")
+	action := flag.String("action", "", "操作: scan, create-manifest, health-report, dump-database, rebuild-database, list-series, list-media, search, stats, list-runs, show-run, run-journal, verify-run, create-pairing-code, list-devices, revoke-device")
 	seriesID := flag.String("series-id", "", "用于 list-media 的系列ID")
 	mediaTypeFlag := flag.String("media-type", "image", "用于 list-media 的媒体类型，例如 image, video, audio, text")
 	runID := flag.String("run-id", "", "用于 show-run, run-journal 的运行ID")
+	deviceID := flag.String("device-id", "", "用于 revoke-device 的设备ID")
+	deviceName := flag.String("device-name", "", "用于 create-pairing-code 的设备名")
+	scopeFlag := flag.String("scope", "viewer", "用于 create-pairing-code 的权限: viewer, maintainer, admin")
+	ttlFlag := flag.String("ttl", "", "用于 create-pairing-code 的有效期，例如 24h；为空时使用 security.defaultPairingTTL 或 24h")
 	query := flag.String("query", "", "用于 search 的系列名关键词")
 	mode := flag.String("mode", "", "扫描模式: full, classifyOnly")
 	scanPath := flag.String("scan-path", "", "覆盖 scanner.scanPath")
@@ -145,6 +150,24 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "create-pairing-code":
+		if err := createPairingCode(ctx, &cfg, *deviceName, *scopeFlag, *ttlFlag); err != nil {
+			slog.Error("创建设备配对码失败", "error", err)
+			os.Exit(1)
+		}
+
+	case "list-devices":
+		if err := listDevices(ctx, &cfg); err != nil {
+			slog.Error("列出设备失败", "error", err)
+			os.Exit(1)
+		}
+
+	case "revoke-device":
+		if err := revokeDevice(ctx, &cfg, *deviceID); err != nil {
+			slog.Error("撤销设备失败", "error", err)
+			os.Exit(1)
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "错误: 未知 action %q\n", *action)
 		flag.Usage()
@@ -240,10 +263,13 @@ func runScan(ctx context.Context, cfg *config.Config) error {
 		Status:     string(runstate.StatusCompleted),
 		Checkpoint: true,
 	})
-	return runStore.Update(context.Background(), runID, func(run *runstate.Run) {
+	if err := runStore.Update(context.Background(), runID, func(run *runstate.Run) {
 		run.Status = runstate.StatusCompleted
 		run.EndedAt = &endTime
-	})
+	}); err != nil {
+		return err
+	}
+	return applyRunRetention(context.Background(), cfg, runStore)
 }
 
 func scanRequiresDatabase(mode string) bool {
@@ -357,7 +383,25 @@ func runDatabaseRebuild(ctx context.Context, cfg *config.Config) error {
 	}); err != nil {
 		return err
 	}
+	if err := applyRunRetention(context.Background(), cfg, runStore); err != nil {
+		return err
+	}
 	fmt.Printf("database rebuild completed runID=%s series=%d media=%d\n", runID, stats.Series, stats.Media)
+	return nil
+}
+
+func applyRunRetention(ctx context.Context, cfg *config.Config, store *runstate.Store) error {
+	if cfg == nil || store == nil {
+		return nil
+	}
+	maxAge := time.Duration(cfg.RunRetention.MaxAgeDays) * 24 * time.Hour
+	removed, err := store.Prune(ctx, cfg.RunRetention.MaxRuns, maxAge)
+	if err != nil {
+		return err
+	}
+	if removed > 0 {
+		slog.Info("已清理旧运行记录", "removed", removed)
+	}
 	return nil
 }
 
@@ -665,6 +709,82 @@ func verifyRunRecovery(ctx context.Context, cfg *config.Config, runID string) er
 	if recoveryStatus != "complete" {
 		fmt.Println("recoveryHint=re-run scan in classifyOnly or run rebuild-database for DB reconciliation after inspecting the health report")
 	}
+	return nil
+}
+
+func createPairingCode(ctx context.Context, cfg *config.Config, deviceName string, scopeRaw string, ttlRaw string) error {
+	scope, err := security.NormalizeScope(scopeRaw)
+	if err != nil {
+		return err
+	}
+	ttl := 24 * time.Hour
+	if strings.TrimSpace(cfg.Security.DefaultPairingTTL) != "" {
+		ttl, err = time.ParseDuration(cfg.Security.DefaultPairingTTL)
+		if err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(ttlRaw) != "" {
+		ttl, err = time.ParseDuration(ttlRaw)
+		if err != nil {
+			return err
+		}
+	}
+	store, err := security.NewStore(config.SecurityStorePath(cfg))
+	if err != nil {
+		return err
+	}
+	code, pairing, err := store.CreatePairingCode(ctx, strings.TrimSpace(deviceName), scope, ttl)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("pairingCode=%s\nid=%s\nscope=%s\nexpiresAt=%s\nstore=%s\n",
+		code, pairing.ID, pairing.Scope, pairing.ExpiresAt.Format(time.RFC3339), config.SecurityStorePath(cfg))
+	if !cfg.Security.Enabled {
+		fmt.Println("warning=security.enabled is false; enable it before expecting the server to require paired devices")
+	}
+	return nil
+}
+
+func listDevices(ctx context.Context, cfg *config.Config) error {
+	store, err := security.NewStore(config.SecurityStorePath(cfg))
+	if err != nil {
+		return err
+	}
+	devices, err := store.ListDevices(ctx)
+	if err != nil {
+		return err
+	}
+	for _, device := range devices {
+		status := "active"
+		if device.RevokedAt != nil {
+			status = "revoked"
+		} else if device.ExpiresAt != nil && time.Now().After(*device.ExpiresAt) {
+			status = "expired"
+		}
+		lastSeen := ""
+		if !device.LastSeenAt.IsZero() {
+			lastSeen = device.LastSeenAt.Format(time.RFC3339)
+		}
+		fmt.Printf("%s  name=%s  scope=%s  status=%s  created=%s  lastSeen=%s\n",
+			device.ID, device.Name, device.Scope, status, device.CreatedAt.Format(time.RFC3339), lastSeen)
+	}
+	return nil
+}
+
+func revokeDevice(ctx context.Context, cfg *config.Config, deviceID string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return fmt.Errorf("revoke-device 需要 -device-id")
+	}
+	store, err := security.NewStore(config.SecurityStorePath(cfg))
+	if err != nil {
+		return err
+	}
+	if err := store.RevokeDevice(ctx, deviceID); err != nil {
+		return err
+	}
+	fmt.Printf("device revoked: %s\n", deviceID)
 	return nil
 }
 

@@ -19,6 +19,7 @@ pkg/hasher/         SHA-256、pHash 和 pHash buckets
 pkg/maintenance/    文件清单和数据库备份
 pkg/runstate/       run 状态、JSONL journal 和维护锁
 pkg/scanner/        预处理、分类、聚合、入库协调
+pkg/security/       设备绑定、配对码、token 哈希和 scope 鉴权
 pkg/thumbnailer/    图片缩略图生成
 web/                React/TypeScript 前端
 ```
@@ -46,6 +47,8 @@ web/                React/TypeScript 前端
 
 `internal/task.Manager` 在启动后台扫描前创建 run 并占用维护锁，任务结束后释放锁。CLI 的 `scan` 也使用同一个锁，避免 server 和 SSH 手工命令并发整理同一批文件。
 
+`manager-server` 内置调度器读取 `scheduler.enabled/interval/mode/runOnStartup`。调度器只调用 `StartNewScanTask(config.C.Scanner.ScanPath, mode)`，不能增加绕过维护锁的后台入口。
+
 后端启动时必须调用 `RecoverUnfinishedRuns`。它会把上次遗留的 `pending/running` run 标记为 `interrupted`，并清理旧锁文件。当前策略是标记中断，不自动重放；后续断点恢复应基于 journal checkpoint 扩展。
 
 `DELETE /api/v1/tasks/{taskId}` 会调用 `StopTask`，取消扫描 context，并把 run 标记为 `stopped`。`POST /api/v1/tasks/{taskId}/pause` 会调用 `PauseTask`，取消扫描 context，并把 run 标记为 `paused`。`stopped/paused` 都表示人为控制且可用最终库和 journal 做恢复判断，不应按普通失败处理。
@@ -66,6 +69,7 @@ Orchestrator 通过 context 携带 `runstate.Recorder`。新增阶段时应同�
 - 以图搜图必须使用 pHash bucket 缩小候选集，不能回退到全量读取所有 pHash 后在 Go 中扫描。
 - 同名不同哈希文件必须进入 `.same-name/<bucket>/<sha256>/<filename>`，不要改成简单追加 `-1`、`-2`。
 - CLI 和 server 都必须走 runstate 维护锁，不能新增绕过锁的扫描入口。
+- symlink 默认跳过。新增文件遍历或下载入口必须复用同等真实路径约束，不能让路径逃出扫描根或最终库。
 
 ## 配置和环境变量
 
@@ -90,7 +94,37 @@ NAS 运行控制字段：
 - `scanner.ioThrottleMs`：分类移动文件前的轻量 sleep，用于降低 IO 峰值。
 - `scanner.maintenanceWindow`：`HH:MM-HH:MM`，启动扫描时如果不在窗口内会拒绝运行。
 - `scanner.maxFilesPerDir`：目录健康报告阈值。
-- `server.maintenanceToken`：可选维护 API token。设置后，维护接口要求 `Authorization: Bearer` 或 `X-Maintenance-Token`。
+- `scanner.followSymlinks`：默认跳过 symlink；开启时必须校验 EvalSymlinks 后仍在允许根目录内。
+- `security.enabled`：开启设备绑定。
+- `security.storePath`：设备和配对码 JSON store；留空使用 `<logger.path>/auth/devices.json`。
+- `security.requireViewerForRead`：查看接口是否也要求 viewer token。
+- `security.allowLocalAdmin`：本机 admin 配置豁免。
+- `scheduler.*`：无人值守调度。
+- `runRetention.*`：已结束 run/journal 清理策略。
+- `server.maintenanceToken`：旧版兼容维护 token。新功能应优先走 `pkg/security`。
+
+## 安全边界
+
+设备绑定由 `pkg/security` 实现：
+
+- CLI 生成一次性配对码，只在终端显示明文。
+- 前端用配对码调用 `/api/v1/auth/claim`，只返回一次明文 token。
+- JSON store 中只保存配对码哈希和 token 哈希。
+- scope 顺序为 `viewer < maintainer < admin`。
+
+API route 必须显式声明 scope：
+
+- viewer：只读查看、搜索、缩略图、下载。
+- maintainer：任务启动/停止/暂停、run/journal。
+- admin：配置读取和更新。
+
+远程请求限制：
+
+- `PUT /config` 在 `security.enabled` 且非本机请求时必须保留数据库、日志、端口、超时和所有扫描关键路径。
+- `POST /tasks` 在同样条件下必须忽略请求体 path，改用 `config.C.Scanner.ScanPath`。
+- 下载接口只接受数据库 ObjectID，经 `safeLibraryPath` 校验后读取文件；不能新增按 path 下载的接口。
+
+传输安全不在项目内自建，部署时应由 Tailscale、反代或 NAS 平台提供 TLS/网络隔离。
 
 ## 数据库索引
 
@@ -150,6 +184,20 @@ GET /api/v1/runs/{runId}
 GET /api/v1/runs/{runId}/journal
 ```
 
+设备绑定 API：
+
+```text
+GET  /api/v1/auth/status
+POST /api/v1/auth/claim
+```
+
+下载 API：
+
+```text
+GET /api/v1/media/{mediaId}/download
+GET /api/v1/series/{seriesId}/download
+```
+
 维护 API：
 
 ```text
@@ -159,7 +207,7 @@ POST   /api/v1/tasks/{taskId}/pause
 PUT    /api/v1/config
 ```
 
-设置 `server.maintenanceToken` 后，上述维护 API 必须带 token；查看 API 不需要 token。
+设置 `server.maintenanceToken` 后，上述维护 API 必须带 token；开启 `security.enabled` 后按 scope 鉴权，旧 token 仅作为 admin 兼容入口。
 
 ## 前端约定
 

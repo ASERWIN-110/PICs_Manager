@@ -36,13 +36,18 @@ type ImagePreprocessor interface {
 }
 
 type defaultPreprocessor struct {
-	numWorkers int
-	recorder   runstate.Recorder
-	logger     *log.Logger
-	logFile    *os.File
+	numWorkers     int
+	followSymlinks bool
+	recorder       runstate.Recorder
+	logger         *log.Logger
+	logFile        *os.File
 }
 
 func NewPreprocessor(logDir string, workerCount int, recorders ...runstate.Recorder) (ImagePreprocessor, error) {
+	return NewPreprocessorWithSymlinkPolicy(logDir, workerCount, false, recorders...)
+}
+
+func NewPreprocessorWithSymlinkPolicy(logDir string, workerCount int, followSymlinks bool, recorders ...runstate.Recorder) (ImagePreprocessor, error) {
 	var recorder runstate.Recorder
 	if len(recorders) > 0 {
 		recorder = recorders[0]
@@ -55,7 +60,7 @@ func NewPreprocessor(logDir string, workerCount int, recorders ...runstate.Recor
 	logger := log.New(file, "PREPROCESS: ", log.LstdFlags|log.Lshortfile)
 	workerCount = defaultWorkerCount(workerCount)
 	logger.Printf("预处理器初始化成功，并发数: %d", workerCount)
-	return &defaultPreprocessor{numWorkers: workerCount, recorder: recorder, logger: logger, logFile: file}, nil
+	return &defaultPreprocessor{numWorkers: workerCount, followSymlinks: followSymlinks, recorder: recorder, logger: logger, logFile: file}, nil
 }
 
 func (p *defaultPreprocessor) Close() {
@@ -94,6 +99,16 @@ func (p *defaultPreprocessor) ProcessDirectory(rootDir string) ([]string, error)
 		if err != nil {
 			return err
 		}
+		allowed, allowErr := allowFilesystemEntry(rootDir, path, d, p.followSymlinks)
+		if allowErr != nil {
+			return allowErr
+		}
+		if !allowed {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if !d.IsDir() {
 			finalFiles = append(finalFiles, path)
 		}
@@ -113,6 +128,16 @@ func (p *defaultPreprocessor) scanAndGroupFiles(rootDir string) (map[string]*fil
 	err := filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		allowed, allowErr := allowFilesystemEntry(rootDir, path, d, p.followSymlinks)
+		if allowErr != nil {
+			return allowErr
+		}
+		if !allowed {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() || !isImageExtension(path) {
 			return nil

@@ -15,6 +15,13 @@ interface ConfigInputProps {
     disabled?: boolean;
 }
 
+interface ConfigCheckboxProps {
+    label: string;
+    name: string;
+    checked: boolean;
+    onChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
+}
+
 type MutableConfigNode = Record<string, unknown>;
 
 const cloneConfig = (config: AppConfig): AppConfig => JSON.parse(JSON.stringify(config)) as AppConfig;
@@ -69,6 +76,13 @@ const ConfigInput = ({ label, name, value, onChange, type = 'text', disabled = f
     <label className="form-row">
         <span>{label}</span>
         <input type={type} name={name} value={value} onChange={onChange} disabled={disabled} />
+    </label>
+);
+
+const ConfigCheckbox = ({ label, name, checked, onChange }: ConfigCheckboxProps) => (
+    <label className="form-row checkbox-row">
+        <span>{label}</span>
+        <input type="checkbox" name={name} checked={checked} onChange={onChange} />
     </label>
 );
 
@@ -141,6 +155,22 @@ const AdminPage = () => {
             const lastKey = keys[keys.length - 1];
             const originalValue = currentLevel[lastKey];
             currentLevel[lastKey] = typeof originalValue === 'number' ? Number(value) : value;
+            return nextConfig;
+        });
+    };
+
+    const handleCheckboxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const { name, checked } = event.target;
+        const keys = name.split('.');
+
+        setConfig(prevConfig => {
+            if (!prevConfig) return null;
+            const nextConfig = cloneConfig(prevConfig);
+            let currentLevel: MutableConfigNode = nextConfig as unknown as MutableConfigNode;
+            for (let i = 0; i < keys.length - 1; i++) {
+                currentLevel = currentLevel[keys[i]] as MutableConfigNode;
+            }
+            currentLevel[keys[keys.length - 1]] = checked;
             return nextConfig;
         });
     };
@@ -380,6 +410,20 @@ const AdminPage = () => {
                         <ConfigInput label="重复目录" name="scanner.duplicatesDir" value={config.scanner.duplicatesDir} onChange={handleConfigChange} />
                         <ConfigInput label="并发数" name="scanner.workerCount" value={config.scanner.workerCount} onChange={handleConfigChange} type="number" />
                         <ConfigInput label="批处理大小" name="scanner.batchSize" value={config.scanner.batchSize} onChange={handleConfigChange} type="number" />
+                        <ConfigInput label="IO 节流 ms" name="scanner.ioThrottleMs" value={config.scanner.ioThrottleMs} onChange={handleConfigChange} type="number" />
+                        <ConfigInput label="维护窗口" name="scanner.maintenanceWindow" value={config.scanner.maintenanceWindow} onChange={handleConfigChange} />
+                        <ConfigInput label="目录阈值" name="scanner.maxFilesPerDir" value={config.scanner.maxFilesPerDir} onChange={handleConfigChange} type="number" />
+                        <ConfigCheckbox label="允许 symlink" name="scanner.followSymlinks" checked={config.scanner.followSymlinks} onChange={handleCheckboxChange} />
+                        <ConfigCheckbox label="启用绑定" name="security.enabled" checked={config.security.enabled} onChange={handleCheckboxChange} />
+                        <ConfigCheckbox label="查看需配对" name="security.requireViewerForRead" checked={config.security.requireViewerForRead} onChange={handleCheckboxChange} />
+                        <ConfigCheckbox label="本机 admin" name="security.allowLocalAdmin" checked={config.security.allowLocalAdmin} onChange={handleCheckboxChange} />
+                        <ConfigInput label="配对有效期" name="security.defaultPairingTTL" value={config.security.defaultPairingTTL} onChange={handleConfigChange} />
+                        <ConfigCheckbox label="启用调度" name="scheduler.enabled" checked={config.scheduler.enabled} onChange={handleCheckboxChange} />
+                        <ConfigInput label="调度间隔" name="scheduler.interval" value={config.scheduler.interval} onChange={handleConfigChange} />
+                        <ConfigInput label="调度模式" name="scheduler.mode" value={config.scheduler.mode} onChange={handleConfigChange} />
+                        <ConfigCheckbox label="启动即扫" name="scheduler.runOnStartup" checked={config.scheduler.runOnStartup} onChange={handleCheckboxChange} />
+                        <ConfigInput label="保留运行数" name="runRetention.maxRuns" value={config.runRetention.maxRuns} onChange={handleConfigChange} type="number" />
+                        <ConfigInput label="保留天数" name="runRetention.maxAgeDays" value={config.runRetention.maxAgeDays} onChange={handleConfigChange} type="number" />
                     </div>
                 </section>
 

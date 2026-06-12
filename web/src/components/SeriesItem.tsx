@@ -1,7 +1,8 @@
 import React from 'react';
+import DownloadIcon from '@mui/icons-material/Download';
 import FolderIcon from '@mui/icons-material/Folder';
 import type { Series } from '../types/entities';
-import { resolveApiAssetUrl } from '../services/api';
+import { downloadApiFile, resolveApiAssetUrl } from '../services/api';
 
 interface SeriesItemProps {
     series: Series;
@@ -11,6 +12,11 @@ interface SeriesItemProps {
 }
 
 const SeriesItem: React.FC<SeriesItemProps> = ({ series, onClick, onContextMenu, isExpanded }) => {
+    const handleDownload = async (event: React.MouseEvent) => {
+        event.stopPropagation();
+        await downloadApiFile(`/series/${series.id}/download`, `${series.name}.zip`);
+    };
+
     return (
         <div
             className={isExpanded ? 'series-card expanded' : 'series-card'}
@@ -28,7 +34,12 @@ const SeriesItem: React.FC<SeriesItemProps> = ({ series, onClick, onContextMenu,
             </div>
             <div className="series-info">
                 <div className="series-name">{series.name}</div>
-                <div className="series-meta">{series.imageCount} 个媒体</div>
+                <div className="series-meta">
+                    <span>{series.imageCount} 个媒体</span>
+                    <button className="tile-action" type="button" onClick={handleDownload} title="下载系列">
+                        <DownloadIcon fontSize="small" />
+                    </button>
+                </div>
             </div>
         </div>
     );

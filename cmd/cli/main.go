@@ -32,6 +32,7 @@ func main() {
 	deviceName := flag.String("device-name", "", "用于 create-pairing-code 的设备名")
 	scopeFlag := flag.String("scope", "viewer", "用于 create-pairing-code 的权限: viewer, maintainer, admin")
 	ttlFlag := flag.String("ttl", "", "用于 create-pairing-code 的有效期，例如 24h；为空时使用 security.defaultPairingTTL 或 24h")
+	deviceTTLFlag := flag.String("device-ttl", "", "用于 create-pairing-code 的设备 token 有效期，例如 720h；为空时使用 security.defaultDeviceTTL，0 表示不过期")
 	query := flag.String("query", "", "用于 search 的系列名关键词")
 	mode := flag.String("mode", "", "扫描模式: full, classifyOnly")
 	scanPath := flag.String("scan-path", "", "覆盖 scanner.scanPath")
@@ -151,7 +152,7 @@ func main() {
 		}
 
 	case "create-pairing-code":
-		if err := createPairingCode(ctx, &cfg, *deviceName, *scopeFlag, *ttlFlag); err != nil {
+		if err := createPairingCode(ctx, &cfg, *deviceName, *scopeFlag, *ttlFlag, *deviceTTLFlag); err != nil {
 			slog.Error("创建设备配对码失败", "error", err)
 			os.Exit(1)
 		}
@@ -712,7 +713,7 @@ func verifyRunRecovery(ctx context.Context, cfg *config.Config, runID string) er
 	return nil
 }
 
-func createPairingCode(ctx context.Context, cfg *config.Config, deviceName string, scopeRaw string, ttlRaw string) error {
+func createPairingCode(ctx context.Context, cfg *config.Config, deviceName string, scopeRaw string, ttlRaw string, deviceTTLRaw string) error {
 	scope, err := security.NormalizeScope(scopeRaw)
 	if err != nil {
 		return err
@@ -730,16 +731,36 @@ func createPairingCode(ctx context.Context, cfg *config.Config, deviceName strin
 			return err
 		}
 	}
+	deviceTTL := time.Duration(0)
+	if strings.TrimSpace(cfg.Security.DefaultDeviceTTL) != "" {
+		deviceTTL, err = time.ParseDuration(cfg.Security.DefaultDeviceTTL)
+		if err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(deviceTTLRaw) != "" {
+		deviceTTL, err = time.ParseDuration(deviceTTLRaw)
+		if err != nil {
+			return err
+		}
+	}
+	if deviceTTL < 0 {
+		return fmt.Errorf("设备 token 有效期不能为负数")
+	}
 	store, err := security.NewStore(config.SecurityStorePath(cfg))
 	if err != nil {
 		return err
 	}
-	code, pairing, err := store.CreatePairingCode(ctx, strings.TrimSpace(deviceName), scope, ttl)
+	code, pairing, err := store.CreatePairingCodeWithDeviceTTL(ctx, strings.TrimSpace(deviceName), scope, ttl, deviceTTL)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("pairingCode=%s\nid=%s\nscope=%s\nexpiresAt=%s\nstore=%s\n",
-		code, pairing.ID, pairing.Scope, pairing.ExpiresAt.Format(time.RFC3339), config.SecurityStorePath(cfg))
+	deviceExpiresAt := "never"
+	if pairing.DeviceExpiresAt != nil {
+		deviceExpiresAt = pairing.DeviceExpiresAt.Format(time.RFC3339)
+	}
+	fmt.Printf("pairingCode=%s\nid=%s\nscope=%s\npairingExpiresAt=%s\ndeviceExpiresAt=%s\nstore=%s\n",
+		code, pairing.ID, pairing.Scope, pairing.ExpiresAt.Format(time.RFC3339), deviceExpiresAt, config.SecurityStorePath(cfg))
 	if !cfg.Security.Enabled {
 		fmt.Println("warning=security.enabled is false; enable it before expecting the server to require paired devices")
 	}
@@ -766,8 +787,12 @@ func listDevices(ctx context.Context, cfg *config.Config) error {
 		if !device.LastSeenAt.IsZero() {
 			lastSeen = device.LastSeenAt.Format(time.RFC3339)
 		}
-		fmt.Printf("%s  name=%s  scope=%s  status=%s  created=%s  lastSeen=%s\n",
-			device.ID, device.Name, device.Scope, status, device.CreatedAt.Format(time.RFC3339), lastSeen)
+		expiresAt := "never"
+		if device.ExpiresAt != nil {
+			expiresAt = device.ExpiresAt.Format(time.RFC3339)
+		}
+		fmt.Printf("%s  name=%s  scope=%s  status=%s  created=%s  expires=%s  lastSeen=%s\n",
+			device.ID, device.Name, device.Scope, status, device.CreatedAt.Format(time.RFC3339), expiresAt, lastSeen)
 	}
 	return nil
 }

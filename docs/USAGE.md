@@ -61,6 +61,7 @@ security:
   enabled: false
   storePath: ""
   defaultPairingTTL: "24h"
+  defaultDeviceTTL: "0"
   requireViewerForRead: true
   allowLocalAdmin: true
   corsAllowedOrigins: []
@@ -117,10 +118,12 @@ security:
 
 ```bash
 go run ./cmd/cli -action create-pairing-code -device-name family-viewer -scope viewer
-go run ./cmd/cli -action create-pairing-code -device-name admin-laptop -scope admin -ttl 2h
+go run ./cmd/cli -action create-pairing-code -device-name admin-laptop -scope admin -ttl 2h -device-ttl 24h
 ```
 
 打开前端后输入配对码，前端会保存一次性换回的设备 token。服务端只保存 token 哈希，不保存明文 token。
+
+`-ttl` 或 `security.defaultPairingTTL` 控制配对码多久可以被领取；`-device-ttl` 或 `security.defaultDeviceTTL` 控制领取后的设备 token 多久过期。`defaultDeviceTTL: "0"` 表示设备 token 不自动过期，只能手工撤销。
 
 权限级别：
 
@@ -447,8 +450,8 @@ go run ./cmd/verify-scan \
 下载对应平台包后解压：
 
 ```bash
-tar -xzf PICs_Manager_v0.1.3_linux_amd64.tar.gz
-cd PICs_Manager_v0.1.3_linux_amd64
+tar -xzf PICs_Manager_v0.1.4_linux_amd64.tar.gz
+cd PICs_Manager_v0.1.4_linux_amd64
 ```
 
 修改 `config.yaml`，然后运行：

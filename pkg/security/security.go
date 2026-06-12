@@ -45,13 +45,14 @@ type Device struct {
 }
 
 type PairingCode struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name,omitempty"`
-	Scope     Scope      `json:"scope"`
-	CodeHash  string     `json:"codeHash,omitempty"`
-	CreatedAt time.Time  `json:"createdAt"`
-	ExpiresAt time.Time  `json:"expiresAt"`
-	ClaimedAt *time.Time `json:"claimedAt,omitempty"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name,omitempty"`
+	Scope           Scope      `json:"scope"`
+	CodeHash        string     `json:"codeHash,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	ExpiresAt       time.Time  `json:"expiresAt"`
+	DeviceExpiresAt *time.Time `json:"deviceExpiresAt,omitempty"`
+	ClaimedAt       *time.Time `json:"claimedAt,omitempty"`
 }
 
 type Store struct {
@@ -117,6 +118,10 @@ func HasScope(actual Scope, required Scope) bool {
 }
 
 func (s *Store) CreatePairingCode(ctx context.Context, name string, scope Scope, ttl time.Duration) (string, PairingCode, error) {
+	return s.CreatePairingCodeWithDeviceTTL(ctx, name, scope, ttl, 0)
+}
+
+func (s *Store) CreatePairingCodeWithDeviceTTL(ctx context.Context, name string, scope Scope, ttl time.Duration, deviceTTL time.Duration) (string, PairingCode, error) {
 	if err := ctx.Err(); err != nil {
 		return "", PairingCode{}, err
 	}
@@ -138,6 +143,10 @@ func (s *Store) CreatePairingCode(ctx context.Context, name string, scope Scope,
 		CodeHash:  hashSecret(code),
 		CreatedAt: now,
 		ExpiresAt: now.Add(ttl),
+	}
+	if deviceTTL > 0 {
+		expiresAt := now.Add(deviceTTL)
+		pairing.DeviceExpiresAt = &expiresAt
 	}
 
 	s.mu.Lock()
@@ -211,6 +220,7 @@ func (s *Store) ClaimPairingCode(ctx context.Context, code string, deviceName st
 		Scope:     pairing.Scope,
 		TokenHash: hashSecret(token),
 		CreatedAt: now,
+		ExpiresAt: pairing.DeviceExpiresAt,
 	}
 	st.Devices = append(st.Devices, device)
 	if err := s.writeStateUnlocked(st); err != nil {

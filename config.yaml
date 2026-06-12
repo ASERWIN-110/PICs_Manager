@@ -9,7 +9,10 @@ security:
   enabled: false
   # 留空时使用 <logger.path>/auth/devices.json。文件里只保存 token 哈希，不保存明文 token。
   storePath: ""
+  # 配对码有效期；控制配对码多久可以被领取。
   defaultPairingTTL: "24h"
+  # 设备 token 有效期。空字符串或 "0" 表示不过期。
+  defaultDeviceTTL: "0"
   # true 表示查看、搜索、缩略图、下载都需要 viewer/maintainer/admin token。
   requireViewerForRead: true
   # true 表示本机请求可无 token 修改完整配置；远程请求即使 admin token 也不能改数据库、日志和关键路径。

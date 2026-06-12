@@ -418,6 +418,7 @@ const AdminPage = () => {
                         <ConfigCheckbox label="查看需配对" name="security.requireViewerForRead" checked={config.security.requireViewerForRead} onChange={handleCheckboxChange} />
                         <ConfigCheckbox label="本机 admin" name="security.allowLocalAdmin" checked={config.security.allowLocalAdmin} onChange={handleCheckboxChange} />
                         <ConfigInput label="配对有效期" name="security.defaultPairingTTL" value={config.security.defaultPairingTTL} onChange={handleConfigChange} />
+                        <ConfigInput label="设备有效期" name="security.defaultDeviceTTL" value={config.security.defaultDeviceTTL} onChange={handleConfigChange} />
                         <ConfigCheckbox label="启用调度" name="scheduler.enabled" checked={config.scheduler.enabled} onChange={handleCheckboxChange} />
                         <ConfigInput label="调度间隔" name="scheduler.interval" value={config.scheduler.interval} onChange={handleConfigChange} />
                         <ConfigInput label="调度模式" name="scheduler.mode" value={config.scheduler.mode} onChange={handleConfigChange} />

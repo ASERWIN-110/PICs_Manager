@@ -14,6 +14,7 @@ export interface AppConfig {
         enabled: boolean;
         storePath: string;
         defaultPairingTTL: string;
+        defaultDeviceTTL: string;
         allowLocalAdmin: boolean;
         corsAllowedOrigins: string[];
         requireViewerForRead: boolean;

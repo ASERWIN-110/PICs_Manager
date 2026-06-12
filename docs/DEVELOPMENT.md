@@ -97,6 +97,8 @@ NAS 运行控制字段：
 - `scanner.followSymlinks`：默认跳过 symlink；开启时必须校验 EvalSymlinks 后仍在允许根目录内。
 - `security.enabled`：开启设备绑定。
 - `security.storePath`：设备和配对码 JSON store；留空使用 `<logger.path>/auth/devices.json`。
+- `security.defaultPairingTTL`：配对码领取有效期。
+- `security.defaultDeviceTTL`：设备 token 有效期；`0` 或空字符串表示不过期。
 - `security.requireViewerForRead`：查看接口是否也要求 viewer token。
 - `security.allowLocalAdmin`：本机 admin 配置豁免。
 - `scheduler.*`：无人值守调度。
@@ -110,6 +112,7 @@ NAS 运行控制字段：
 - CLI 生成一次性配对码，只在终端显示明文。
 - 前端用配对码调用 `/api/v1/auth/claim`，只返回一次明文 token。
 - JSON store 中只保存配对码哈希和 token 哈希。
+- 配对码可携带设备 token 过期时间，`Authenticate` 必须拒绝已撤销或已过期设备。
 - scope 顺序为 `viewer < maintainer < admin`。
 
 API route 必须显式声明 scope：

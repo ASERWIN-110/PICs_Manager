@@ -412,6 +412,69 @@ func TestMediaDownloadSupportsRangeAndRejectsOutsideLibrary(t *testing.T) {
 	}
 }
 
+func TestMediaDownloadSymlinkPolicy(t *testing.T) {
+	oldConfig := config.C
+	t.Cleanup(func() { config.C = oldConfig })
+
+	root := t.TempDir()
+	library := filepath.Join(root, "library")
+	if err := os.MkdirAll(library, 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	insideTarget := filepath.Join(library, "inside.txt")
+	if err := os.WriteFile(insideTarget, []byte("inside"), 0o644); err != nil {
+		t.Fatalf("WriteFile inside returned error: %v", err)
+	}
+	insideLink := filepath.Join(library, "inside-link.txt")
+	if err := os.Symlink(insideTarget, insideLink); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	mediaID := primitive.NewObjectID()
+	config.C = &config.Config{Scanner: config.ScannerConfig{FinalLibraryPath: library}}
+	router := RegisterRoutesWithRunStore(nil, apiDownloadStore{media: &models.Image{
+		ID:       mediaID,
+		FileName: "inside-link.txt",
+		FilePath: insideLink,
+	}})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/media/"+mediaID.Hex()+"/download", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected symlink to be rejected by default, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	config.C.Scanner.FollowSymlinks = true
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected confined symlink to be allowed, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "inside" {
+		t.Fatalf("expected symlink target body %q, got %q", "inside", got)
+	}
+
+	outsideTarget := filepath.Join(root, "outside.txt")
+	if err := os.WriteFile(outsideTarget, []byte("outside"), 0o644); err != nil {
+		t.Fatalf("WriteFile outside returned error: %v", err)
+	}
+	outsideLink := filepath.Join(library, "outside-link.txt")
+	if err := os.Symlink(outsideTarget, outsideLink); err != nil {
+		t.Fatalf("Symlink outside returned error: %v", err)
+	}
+	router = RegisterRoutesWithRunStore(nil, apiDownloadStore{media: &models.Image{
+		ID:       mediaID,
+		FileName: "outside-link.txt",
+		FilePath: outsideLink,
+	}})
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/media/"+mediaID.Hex()+"/download", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected escaping symlink to be rejected, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestServeThumbnailStreamsDecodedImage(t *testing.T) {
 	rec := httptest.NewRecorder()
 	serveThumbnail(rec, "data:image/jpeg;base64,/9j/")

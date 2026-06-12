@@ -49,6 +49,7 @@ type SecurityConfig struct {
 	Enabled              bool     `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
 	StorePath            string   `mapstructure:"storePath" json:"storePath" yaml:"storePath"`
 	DefaultPairingTTL    string   `mapstructure:"defaultPairingTTL" json:"defaultPairingTTL" yaml:"defaultPairingTTL"`
+	DefaultDeviceTTL     string   `mapstructure:"defaultDeviceTTL" json:"defaultDeviceTTL" yaml:"defaultDeviceTTL"`
 	AllowLocalAdmin      bool     `mapstructure:"allowLocalAdmin" json:"allowLocalAdmin" yaml:"allowLocalAdmin"`
 	CORSAllowedOrigins   []string `mapstructure:"corsAllowedOrigins" json:"corsAllowedOrigins" yaml:"corsAllowedOrigins"`
 	RequireViewerForRead bool     `mapstructure:"requireViewerForRead" json:"requireViewerForRead" yaml:"requireViewerForRead"`
@@ -328,6 +329,15 @@ func ValidateConfig(cfg Config) error {
 	if strings.TrimSpace(cfg.Security.DefaultPairingTTL) != "" {
 		if _, err := time.ParseDuration(cfg.Security.DefaultPairingTTL); err != nil {
 			return fmt.Errorf("security.defaultPairingTTL must be a duration, got %q: %w", cfg.Security.DefaultPairingTTL, err)
+		}
+	}
+	if strings.TrimSpace(cfg.Security.DefaultDeviceTTL) != "" {
+		duration, err := time.ParseDuration(cfg.Security.DefaultDeviceTTL)
+		if err != nil {
+			return fmt.Errorf("security.defaultDeviceTTL must be a duration, got %q: %w", cfg.Security.DefaultDeviceTTL, err)
+		}
+		if duration < 0 {
+			return fmt.Errorf("security.defaultDeviceTTL must be >= 0, got %q", cfg.Security.DefaultDeviceTTL)
 		}
 	}
 	if strings.TrimSpace(cfg.Scheduler.Interval) != "" {

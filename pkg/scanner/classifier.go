@@ -3,6 +3,8 @@ package scanner
 import (
 	"PICs_Manager/config"
 	"PICs_Manager/pkg/hasher"
+	"PICs_Manager/pkg/runstate"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -22,6 +25,7 @@ const (
 type classificationResult struct {
 	seriesName string
 	fileName   string
+	finalPath  string
 	duplicate  bool
 	err        error
 }
@@ -40,12 +44,18 @@ type compiledMediaType struct {
 type regexClassifier struct {
 	destPath   string
 	mediaTypes []compiledMediaType
+	recorder   runstate.Recorder
+	ioThrottle time.Duration
 	moveMu     sync.Mutex
 	logger     *log.Logger
 	logFile    *os.File
 }
 
-func NewClassifier(logDir string, destPath string, scannerCfg config.ScannerConfig) (SeriesClassifier, error) {
+func NewClassifierWithRecorder(logDir string, destPath string, scannerCfg config.ScannerConfig, recorders ...runstate.Recorder) (SeriesClassifier, error) {
+	var recorder runstate.Recorder
+	if len(recorders) > 0 {
+		recorder = recorders[0]
+	}
 	logFilePath := filepath.Join(logDir, classifierLogFileName)
 	file, err := os.OpenFile(logFilePath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
@@ -61,6 +71,8 @@ func NewClassifier(logDir string, destPath string, scannerCfg config.ScannerConf
 	return &regexClassifier{
 		destPath:   destPath,
 		mediaTypes: mediaTypes,
+		recorder:   recorder,
+		ioThrottle: time.Duration(scannerCfg.IOThrottleMs) * time.Millisecond,
 		logger:     logger,
 		logFile:    file,
 	}, nil
@@ -139,10 +151,23 @@ func (c *regexClassifier) ClassifyAndMove(healthyFiles []string) ([]string, []st
 }
 
 func (c *regexClassifier) moveClassifiedFile(filePath, fileName, seriesName, mediaType string) classificationResult {
-	targetDir := filepath.Join(c.destPath, seriesName)
+	targetDir := filepath.Join(c.destPath, mediaStorageRoot(mediaType), seriesName)
+	c.record(runstate.Event{
+		Phase:  "classify",
+		Action: "file_before_classify",
+		Source: filePath,
+		Metadata: map[string]string{
+			"fileName":  fileName,
+			"series":    seriesName,
+			"mediaType": mediaType,
+		},
+	})
 
 	c.moveMu.Lock()
 	defer c.moveMu.Unlock()
+	if c.ioThrottle > 0 {
+		time.Sleep(c.ioThrottle)
+	}
 
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return classificationResult{fileName: fileName, seriesName: seriesName, err: fmt.Errorf("无法创建系列目录 %s: %w", targetDir, err)}
@@ -155,14 +180,24 @@ func (c *regexClassifier) moveClassifiedFile(filePath, fileName, seriesName, med
 	}
 	if duplicate {
 		c.logger.Printf("同名同哈希重复文件已删除: type=%s %s", mediaType, fileName)
-		return classificationResult{seriesName: seriesName, fileName: fileName, duplicate: true}
+		c.record(runstate.Event{Phase: "classify", Action: "file_after_classify", Source: filePath, Target: finalPath, Status: "duplicate"})
+		return classificationResult{seriesName: seriesName, fileName: fileName, finalPath: finalPath, duplicate: true}
 	}
 	if isSameNameSourcePath(finalPath) {
 		c.logger.Printf("同名不同哈希文件已移入同名分流目录: type=%s %s -> %s", mediaType, fileName, finalPath)
-		return classificationResult{seriesName: seriesName, fileName: finalName, duplicate: true}
+		c.record(runstate.Event{Phase: "classify", Action: "file_after_classify", Source: filePath, Target: finalPath, Status: "same_name"})
+		return classificationResult{seriesName: seriesName, fileName: finalName, finalPath: finalPath, duplicate: true}
 	}
 	c.logger.Printf("文件已移动: type=%s %s -> %s", mediaType, fileName, finalPath)
-	return classificationResult{seriesName: seriesName, fileName: finalName}
+	c.record(runstate.Event{Phase: "classify", Action: "file_after_classify", Source: filePath, Target: finalPath, Status: "moved"})
+	return classificationResult{seriesName: seriesName, fileName: finalName, finalPath: finalPath}
+}
+
+func (c *regexClassifier) record(event runstate.Event) {
+	if c.recorder.Store == nil || c.recorder.RunID == "" {
+		return
+	}
+	c.recorder.Event(context.Background(), event)
 }
 
 func resolveSameNameTarget(srcPath, desiredPath string, forceConflict bool) (targetPath string, targetName string, duplicate bool, err error) {
@@ -400,6 +435,42 @@ func effectiveMediaTypes(scannerCfg config.ScannerConfig) []config.MediaTypeConf
 
 func defaultImageExtensions() []string {
 	return []string{".jpg", ".jpeg", ".png", ".gif", ".webp"}
+}
+
+func mediaStorageRoot(mediaType string) string {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	re := regexp.MustCompile(`[^a-z0-9_]+`)
+	mediaType = re.ReplaceAllString(mediaType, "_")
+	mediaType = strings.Trim(mediaType, "_")
+	switch mediaType {
+	case "image":
+		return "images"
+	case "video":
+		return "videos"
+	case "audio":
+		return "audios"
+	case "text":
+		return "texts"
+	case "":
+		return "media_unknown"
+	default:
+		return "media_" + mediaType
+	}
+}
+
+func mediaStorageRoots(scannerCfg config.ScannerConfig) []string {
+	seen := map[string]struct{}{}
+	roots := make([]string, 0)
+	for _, mediaType := range effectiveMediaTypes(scannerCfg) {
+		root := mediaStorageRoot(mediaType.Type)
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	return roots
 }
 
 func supportedMediaFiles(paths []string, scannerCfg config.ScannerConfig) ([]string, error) {

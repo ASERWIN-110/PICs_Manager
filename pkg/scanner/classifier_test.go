@@ -16,14 +16,15 @@ func TestClassifierMovesNameConflictToSameNameDirectoryWhenHashDiffers(t *testin
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(destDir, "Series"), 0755); err != nil {
+	seriesDir := filepath.Join(destDir, "images", "Series")
+	if err := os.MkdirAll(seriesDir, 0755); err != nil {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 	if err := os.MkdirAll(sourceDir, 0755); err != nil {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 
-	existingTarget := filepath.Join(destDir, "Series", "Series_1.jpg")
+	existingTarget := filepath.Join(seriesDir, "Series_1.jpg")
 	if err := os.WriteFile(existingTarget, []byte("existing"), 0644); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
@@ -38,7 +39,7 @@ func TestClassifierMovesNameConflictToSameNameDirectoryWhenHashDiffers(t *testin
 	}
 
 	scannerCfg := config.ScannerConfig{FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`}}
-	classifier, err := NewClassifier(logDir, destDir, scannerCfg)
+	classifier, err := NewClassifierWithRecorder(logDir, destDir, scannerCfg)
 	if err != nil {
 		t.Fatalf("NewClassifier returned error: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestClassifierMovesNameConflictToSameNameDirectoryWhenHashDiffers(t *testin
 	if _, err := os.Stat(existingTarget); err != nil {
 		t.Fatalf("existing target missing: %v", err)
 	}
-	expectedSameNamePath := filepath.Join(destDir, "Series", sameNameDirName, "Series_1", sourceHash, "Series_1.jpg")
+	expectedSameNamePath := filepath.Join(seriesDir, sameNameDirName, "Series_1", sourceHash, "Series_1.jpg")
 	if _, err := os.Stat(expectedSameNamePath); err != nil {
 		t.Fatal("expected different-hash same-name file under .same-name")
 	}
@@ -68,7 +69,8 @@ func TestClassifierDeletesNameConflictWhenHashMatches(t *testing.T) {
 	logDir := filepath.Join(root, "logs")
 	destDir := filepath.Join(root, "staging")
 	sourceDir := filepath.Join(root, "source")
-	if err := os.MkdirAll(filepath.Join(destDir, "Series"), 0755); err != nil {
+	seriesDir := filepath.Join(destDir, "images", "Series")
+	if err := os.MkdirAll(seriesDir, 0755); err != nil {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 	if err := os.MkdirAll(sourceDir, 0755); err != nil {
@@ -78,7 +80,7 @@ func TestClassifierDeletesNameConflictWhenHashMatches(t *testing.T) {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 
-	existingTarget := filepath.Join(destDir, "Series", "Series_1.jpg")
+	existingTarget := filepath.Join(seriesDir, "Series_1.jpg")
 	sourceFile := filepath.Join(sourceDir, "Series_1.jpg")
 	if err := os.WriteFile(existingTarget, []byte("same"), 0644); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
@@ -88,7 +90,7 @@ func TestClassifierDeletesNameConflictWhenHashMatches(t *testing.T) {
 	}
 
 	scannerCfg := config.ScannerConfig{FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`}}
-	classifier, err := NewClassifier(logDir, destDir, scannerCfg)
+	classifier, err := NewClassifierWithRecorder(logDir, destDir, scannerCfg)
 	if err != nil {
 		t.Fatalf("NewClassifier returned error: %v", err)
 	}
@@ -121,7 +123,7 @@ func TestClassifierReturnsErrorForUnmatchedInput(t *testing.T) {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 	scannerCfg := config.ScannerConfig{FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`}}
-	classifier, err := NewClassifier(logDir, filepath.Join(root, "staging"), scannerCfg)
+	classifier, err := NewClassifierWithRecorder(logDir, filepath.Join(root, "staging"), scannerCfg)
 	if err != nil {
 		t.Fatalf("NewClassifier returned error: %v", err)
 	}
@@ -154,7 +156,7 @@ func TestClassifierRejectsEmptySanitizedSeriesName(t *testing.T) {
 	}
 
 	scannerCfg := config.ScannerConfig{FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`}}
-	classifier, err := NewClassifier(logDir, destDir, scannerCfg)
+	classifier, err := NewClassifierWithRecorder(logDir, destDir, scannerCfg)
 	if err != nil {
 		t.Fatalf("NewClassifier returned error: %v", err)
 	}
@@ -205,7 +207,7 @@ func TestClassifierUsesIndependentMediaTypePatterns(t *testing.T) {
 			},
 		},
 	}
-	classifier, err := NewClassifier(logDir, destDir, scannerCfg)
+	classifier, err := NewClassifierWithRecorder(logDir, destDir, scannerCfg)
 	if err != nil {
 		t.Fatalf("NewClassifier returned error: %v", err)
 	}
@@ -234,7 +236,7 @@ func TestClassifierDoesNotNormalizeSuffixLikeFileNames(t *testing.T) {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 	scannerCfg := config.ScannerConfig{FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`}}
-	classifier, err := NewClassifier(logDir, filepath.Join(root, "staging"), scannerCfg)
+	classifier, err := NewClassifierWithRecorder(logDir, filepath.Join(root, "staging"), scannerCfg)
 	if err != nil {
 		t.Fatalf("NewClassifier returned error: %v", err)
 	}

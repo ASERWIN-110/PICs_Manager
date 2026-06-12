@@ -4,6 +4,7 @@ import (
 	"PICs_Manager/config"
 	"PICs_Manager/internal/models"
 	"PICs_Manager/pkg/database"
+	"PICs_Manager/pkg/runstate"
 	"context"
 	"errors"
 	"image"
@@ -60,6 +61,41 @@ func TestMediaWorkerUsesProvidedSeriesContext(t *testing.T) {
 	}
 }
 
+func TestMediaWorkerRecordsJournalEvents(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "sample.png")
+	writeTestPNG(t, imagePath)
+	store, err := runstate.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	if err := store.Create(context.Background(), runstate.Run{ID: "run-1"}); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	ingestor := &mongoIngestor{
+		logger:     log.New(io.Discard, "", 0),
+		scannerCfg: scannerConfigForPNG(),
+		recorder:   runstate.Recorder{Store: store, RunID: "run-1"},
+	}
+	series := &models.Series{ID: primitive.NewObjectID(), Name: "sample", Path: dir}
+	jobs := make(chan mediaJob, 1)
+	results := make(chan mediaResult, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go ingestor.mediaWorker(&wg, t.Context(), jobs, results)
+	jobs <- mediaJob{filePath: imagePath, series: series}
+	close(jobs)
+	wg.Wait()
+	close(results)
+	events, err := store.Journal(context.Background(), "run-1")
+	if err != nil {
+		t.Fatalf("Journal returned error: %v", err)
+	}
+	if !hasJournalAction(events, "media_before_upsert") || !hasJournalAction(events, "media_after_prepare") {
+		t.Fatalf("expected media journal events, got %+v", events)
+	}
+}
+
 func TestNewIngestorRejectsMissingDatabaseStore(t *testing.T) {
 	_, err := NewIngestor(t.TempDir(), nil, scannerConfigForPNG(), 1, 1)
 	if err == nil {
@@ -93,6 +129,26 @@ func TestMediaFilesInDirIncludesSameNameVariantsAsRelativePaths(t *testing.T) {
 	}
 	if !got[".same-name/Dup_1/abc123/Dup_1.png"] {
 		t.Fatalf("same-name variant missing: %v", files)
+	}
+}
+
+func TestDiscoverFinalSeriesPathsIgnoresArchiveDirsAndKeepsSeriesDirs(t *testing.T) {
+	root := t.TempDir()
+	library := filepath.Join(root, "library")
+	seriesDir := filepath.Join(library, "D", "Dup")
+	sameNamePath := filepath.Join(seriesDir, sameNameDirName, "Dup_1", "hash", "Dup_1.png")
+	if err := os.MkdirAll(filepath.Dir(sameNamePath), 0755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	writeTestPNG(t, filepath.Join(seriesDir, "Dup_1.png"))
+	writeTestPNGWithColor(t, sameNamePath, color.RGBA{G: 255, A: 255})
+
+	paths, err := discoverFinalSeriesPaths(context.Background(), library, scannerConfigForPNG())
+	if err != nil {
+		t.Fatalf("discoverFinalSeriesPaths returned error: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != seriesDir {
+		t.Fatalf("expected only series dir %s, got %v", seriesDir, paths)
 	}
 }
 
@@ -249,6 +305,7 @@ func (s fakeMetadataStore) Series() database.SeriesStore {
 	return &fakeSeriesStore{}
 }
 func (s fakeMetadataStore) Images() database.ImageStore         { return s.images }
+func (s fakeMetadataStore) Media(string) database.ImageStore    { return s.images }
 func (s fakeMetadataStore) EnsureIndexes(context.Context) error { return nil }
 func (s fakeMetadataStore) Diagnostics(context.Context) (database.Diagnostics, error) {
 	return database.Diagnostics{}, nil

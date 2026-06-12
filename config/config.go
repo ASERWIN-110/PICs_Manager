@@ -36,36 +36,44 @@ type ScannerConfig struct {
 	DuplicatesDir     string            `mapstructure:"duplicatesDir" json:"duplicatesDir" yaml:"duplicatesDir"`
 	WorkerCount       int               `mapstructure:"workerCount" json:"workerCount" yaml:"workerCount"`
 	BatchSize         int               `mapstructure:"batchSize" json:"batchSize" yaml:"batchSize"`
+	IOThrottleMs      int               `mapstructure:"ioThrottleMs" json:"ioThrottleMs" yaml:"ioThrottleMs"`
+	MaintenanceWindow string            `mapstructure:"maintenanceWindow" json:"maintenanceWindow" yaml:"maintenanceWindow"`
+	MaxFilesPerDir    int               `mapstructure:"maxFilesPerDir" json:"maxFilesPerDir" yaml:"maxFilesPerDir"`
 	FilePatterns      []string          `mapstructure:"filePatterns" json:"filePatterns" yaml:"filePatterns"`
 	MediaTypes        []MediaTypeConfig `mapstructure:"mediaTypes" json:"mediaTypes" yaml:"mediaTypes"`
 	SeriesGroupRules  []SeriesGroupRule `mapstructure:"seriesGroupPatterns" json:"seriesGroupPatterns" yaml:"seriesGroupPatterns"`
 }
 
 type ServerConfig struct {
-	Port    string        `mapstructure:"port" yaml:"port"`
-	Timeout time.Duration `mapstructure:"timeout" yaml:"timeout"`
+	Port             string        `mapstructure:"port" json:"port" yaml:"port"`
+	Timeout          time.Duration `mapstructure:"timeout" json:"timeout" yaml:"timeout"`
+	MaintenanceToken string        `mapstructure:"maintenanceToken" json:"maintenanceToken" yaml:"maintenanceToken"`
 }
 
 func (s ServerConfig) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Port    string `json:"port"`
-		Timeout string `json:"timeout"`
+		Port             string `json:"port"`
+		Timeout          string `json:"timeout"`
+		MaintenanceToken string `json:"maintenanceToken,omitempty"`
 	}{
-		Port:    s.Port,
-		Timeout: s.Timeout.String(),
+		Port:             s.Port,
+		Timeout:          s.Timeout.String(),
+		MaintenanceToken: s.MaintenanceToken,
 	})
 }
 
 func (s *ServerConfig) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Port    string          `json:"port"`
-		Timeout json.RawMessage `json:"timeout"`
+		Port             string          `json:"port"`
+		Timeout          json.RawMessage `json:"timeout"`
+		MaintenanceToken string          `json:"maintenanceToken"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 
 	s.Port = wire.Port
+	s.MaintenanceToken = wire.MaintenanceToken
 	if len(wire.Timeout) == 0 || string(wire.Timeout) == "null" {
 		return nil
 	}
@@ -91,11 +99,13 @@ func (s *ServerConfig) UnmarshalJSON(data []byte) error {
 
 func (s ServerConfig) MarshalYAML() (interface{}, error) {
 	return struct {
-		Port    string `yaml:"port"`
-		Timeout string `yaml:"timeout"`
+		Port             string `yaml:"port"`
+		Timeout          string `yaml:"timeout"`
+		MaintenanceToken string `yaml:"maintenanceToken,omitempty"`
 	}{
-		Port:    s.Port,
-		Timeout: s.Timeout.String(),
+		Port:             s.Port,
+		Timeout:          s.Timeout.String(),
+		MaintenanceToken: s.MaintenanceToken,
 	}, nil
 }
 
@@ -188,6 +198,9 @@ func applyEnvOverrides(cfg *Config) {
 	if port := firstEnv("SERVER_PORT", "PIC_MANAGER_SERVER_PORT"); port != "" {
 		cfg.Server.Port = port
 	}
+	if token := firstEnv("MAINTENANCE_TOKEN", "PIC_MANAGER_MAINTENANCE_TOKEN"); token != "" {
+		cfg.Server.MaintenanceToken = token
+	}
 	if uri := firstEnv("DATABASE_URI", "MONGO_URI"); uri != "" {
 		cfg.Database.URI = uri
 	}
@@ -256,6 +269,17 @@ func ValidateConfig(cfg Config) error {
 	if cfg.Scanner.BatchSize < 0 {
 		return fmt.Errorf("scanner.batchSize must be >= 0, got %d", cfg.Scanner.BatchSize)
 	}
+	if cfg.Scanner.IOThrottleMs < 0 {
+		return fmt.Errorf("scanner.ioThrottleMs must be >= 0, got %d", cfg.Scanner.IOThrottleMs)
+	}
+	if cfg.Scanner.MaxFilesPerDir < 0 {
+		return fmt.Errorf("scanner.maxFilesPerDir must be >= 0, got %d", cfg.Scanner.MaxFilesPerDir)
+	}
+	if strings.TrimSpace(cfg.Scanner.MaintenanceWindow) != "" {
+		if err := validateMaintenanceWindow(cfg.Scanner.MaintenanceWindow); err != nil {
+			return err
+		}
+	}
 	for _, pattern := range cfg.Scanner.FilePatterns {
 		if _, err := regexp.Compile(pattern); err != nil {
 			return fmt.Errorf("scanner.filePatterns contains invalid regex %q: %w", pattern, err)
@@ -296,6 +320,19 @@ func ValidateConfig(cfg Config) error {
 		}
 		if _, err := regexp.Compile(rule.Pattern); err != nil {
 			return fmt.Errorf("scanner.seriesGroupPatterns[%d].pattern contains invalid regex %q: %w", i, rule.Pattern, err)
+		}
+	}
+	return nil
+}
+
+func validateMaintenanceWindow(window string) error {
+	parts := strings.Split(strings.TrimSpace(window), "-")
+	if len(parts) != 2 {
+		return fmt.Errorf("scanner.maintenanceWindow must use HH:MM-HH:MM, got %q", window)
+	}
+	for _, part := range parts {
+		if _, err := time.Parse("15:04", strings.TrimSpace(part)); err != nil {
+			return fmt.Errorf("scanner.maintenanceWindow must use HH:MM-HH:MM, got %q: %w", window, err)
 		}
 	}
 	return nil

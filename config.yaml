@@ -1,6 +1,9 @@
 server:
   port: ":8080"
   timeout: 30s
+  # 可选：设置后，POST/DELETE /api/v1/tasks 和 PUT /api/v1/config 需要维护 token。
+  # 支持 Authorization: Bearer <token> 或 X-Maintenance-Token: <token>。
+  maintenanceToken: ""
 
 database:
   uri: "mongodb://localhost:27017"
@@ -43,6 +46,14 @@ scanner:
   # 数据库批量写入的大小。建议值为 100-500。
   # 设置为 0 或不设置，将使用默认值 100。
   batchSize: 100
+
+  # NAS 长期无人值守建议保持保守。0 表示使用程序默认值（最多 4 个 worker）。
+  # 单文件移动前的轻量 IO 节流，单位毫秒。0 表示不节流。
+  ioThrottleMs: 0
+  # 可选维护时间窗口，格式 HH:MM-HH:MM。留空表示任何时间都可运行。
+  maintenanceWindow: ""
+  # 目录健康报告阈值。0 表示不报警。
+  maxFilesPerDir: 5000
   
   # --- 用于“文件分类”的严格规则 (从文件名提取系列名) ---
   filePatterns:

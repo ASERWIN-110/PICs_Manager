@@ -1,6 +1,8 @@
 package scanner
 
 import (
+	"PICs_Manager/pkg/runstate"
+	"context"
 	"fmt"
 	"image"
 
@@ -12,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,22 +37,25 @@ type ImagePreprocessor interface {
 
 type defaultPreprocessor struct {
 	numWorkers int
+	recorder   runstate.Recorder
 	logger     *log.Logger
 	logFile    *os.File
 }
 
-func NewPreprocessor(logDir string, workerCount int) (ImagePreprocessor, error) {
+func NewPreprocessor(logDir string, workerCount int, recorders ...runstate.Recorder) (ImagePreprocessor, error) {
+	var recorder runstate.Recorder
+	if len(recorders) > 0 {
+		recorder = recorders[0]
+	}
 	logFilePath := filepath.Join(logDir, preprocessLogFileName)
 	file, err := os.OpenFile(logFilePath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("无法初始化预处理器日志: %w", err)
 	}
 	logger := log.New(file, "PREPROCESS: ", log.LstdFlags|log.Lshortfile)
-	if workerCount <= 0 {
-		workerCount = runtime.NumCPU()
-	}
+	workerCount = defaultWorkerCount(workerCount)
 	logger.Printf("预处理器初始化成功，并发数: %d", workerCount)
-	return &defaultPreprocessor{numWorkers: workerCount, logger: logger, logFile: file}, nil
+	return &defaultPreprocessor{numWorkers: workerCount, recorder: recorder, logger: logger, logFile: file}, nil
 }
 
 func (p *defaultPreprocessor) Close() {
@@ -164,9 +168,11 @@ func (p *defaultPreprocessor) reconciliationWorker(wg *sync.WaitGroup, tasks <-c
 				}
 				if duplicate {
 					p.logger.Printf("编号副本 '%s' 与基础文件哈希相同，已删除重复文件。", filepath.Base(numberedPath))
+					p.record(runstate.Event{Phase: "preprocess", Action: "file_after_preprocess", Source: numberedPath, Target: targetPath, Status: "duplicate_removed"})
 					continue
 				}
 				p.logger.Printf("编号副本 '%s' 与基础文件不同，已整理为 '%s'。", filepath.Base(numberedPath), filepath.Base(targetPath))
+				p.record(runstate.Event{Phase: "preprocess", Action: "file_after_preprocess", Source: numberedPath, Target: targetPath, Status: "same_name"})
 			}
 		}
 	}
@@ -212,6 +218,7 @@ func (p *defaultPreprocessor) findAndExecuteRepair(group *fileGroup) {
 
 		if isImageFileDamaged(candidatePath) {
 			p.logger.Printf("  -> 候选文件 %s 已损坏，继续寻找下一个...", candidateName)
+			p.record(runstate.Event{Phase: "preprocess", Action: "repair_candidate_damaged", Source: candidatePath, Status: "damaged"})
 			continue
 		}
 
@@ -220,22 +227,34 @@ func (p *defaultPreprocessor) findAndExecuteRepair(group *fileGroup) {
 			p.logger.Printf("错误: 生成损坏原件保留路径失败: %v", err)
 			return
 		}
+		p.record(runstate.Event{Phase: "preprocess", Action: "file_before_repair", Source: group.basePath, Target: corruptedOriginalPath, Status: "move_corrupted_original"})
 		if err := os.Rename(group.basePath, corruptedOriginalPath); err != nil {
 			p.logger.Printf("错误: 保留损坏基础文件失败: %v", err)
+			p.record(runstate.Event{Phase: "preprocess", Action: "file_after_repair", Source: group.basePath, Target: corruptedOriginalPath, Status: "failed", Error: err.Error()})
 			return
 		}
+		p.record(runstate.Event{Phase: "preprocess", Action: "file_before_repair", Source: candidatePath, Target: group.basePath, Status: "promote_candidate"})
 		if err := os.Rename(candidatePath, group.basePath); err != nil {
 			p.logger.Printf("错误: 重命名修复文件失败: %v", err)
 			if rollbackErr := os.Rename(corruptedOriginalPath, group.basePath); rollbackErr != nil {
 				p.logger.Printf("严重错误: 修复回滚失败: %v", rollbackErr)
 			}
+			p.record(runstate.Event{Phase: "preprocess", Action: "file_after_repair", Source: candidatePath, Target: group.basePath, Status: "failed", Error: err.Error()})
 			return
 		}
+		p.record(runstate.Event{Phase: "preprocess", Action: "file_after_repair", Source: candidatePath, Target: group.basePath, Status: "repaired"})
 		p.logger.Printf("  -> 文件修复成功: '%s' 已由 '%s' 补位；损坏原件保留为 '%s'。",
 			filepath.Base(group.basePath), candidateName, filepath.Base(corruptedOriginalPath))
 		return
 	}
 	p.logger.Printf("  -> 未能为 '%s' 找到任何健康的修复副本。", filepath.Base(group.basePath))
+}
+
+func (p *defaultPreprocessor) record(event runstate.Event) {
+	if p.recorder.Store == nil || p.recorder.RunID == "" {
+		return
+	}
+	p.recorder.Event(context.Background(), event)
 }
 
 // isImageFileDamaged 是一个不带 receiver 的辅助函数版本

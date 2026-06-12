@@ -1,0 +1,21 @@
+[Unit]
+Description=PICs Manager NAS maintenance service
+After=network-online.target mongod.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pics-manager
+Group=pics-manager
+WorkingDirectory=/opt/pics-manager
+Environment=PIC_MANAGER_ENV_FILE=/etc/pics-manager/pics-manager.env
+ExecStart=/opt/pics-manager/manager-server
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/pics-manager /var/log/pics-manager /srv/media
+
+[Install]
+WantedBy=multi-user.target

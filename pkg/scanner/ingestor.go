@@ -5,6 +5,7 @@ import (
 	"PICs_Manager/internal/models"
 	"PICs_Manager/pkg/database"
 	"PICs_Manager/pkg/hasher"
+	"PICs_Manager/pkg/runstate"
 	"PICs_Manager/pkg/thumbnailer"
 	"bytes"
 	"context"
@@ -14,7 +15,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +27,18 @@ import (
 
 type MetadataIngestor interface {
 	Sync(ctx context.Context, finalLibraryPath string, createdSeries, processedFileNames []string, changelog map[string]string) (overwrittenFiles []string, err error)
+	RebuildFromLibrary(ctx context.Context, finalLibraryPath string) (RebuildStats, error)
 	Close()
+}
+
+type RebuildStats struct {
+	Series int
+	Media  int
 }
 
 type mongoIngestor struct {
 	dbStore    database.Store
+	recorder   runstate.Recorder
 	logger     *log.Logger
 	logFile    *os.File
 	numWorkers int
@@ -54,12 +62,11 @@ func NewIngestor(logDir string, dbStore database.Store, scannerCfg config.Scanne
 	if batchSize <= 0 {
 		batchSize = 100
 	}
-	if workerCount <= 0 {
-		workerCount = runtime.NumCPU()
-	}
+	workerCount = defaultWorkerCount(workerCount)
 
 	return &mongoIngestor{
 		dbStore:    dbStore,
+		recorder:   recorderFromContext(context.Background()),
 		logger:     logger,
 		logFile:    file,
 		numWorkers: workerCount,
@@ -77,6 +84,9 @@ func (m *mongoIngestor) Close() {
 
 // Sync 实现了将文件系统变更同步到数据库的核心逻辑
 func (m *mongoIngestor) Sync(ctx context.Context, finalLibraryPath string, createdSeries, processedFileNames []string, changelog map[string]string) ([]string, error) {
+	if recorder, ok := runstate.FromContext(ctx); ok {
+		m.recorder = recorder
+	}
 	m.logger.Println("================== 新的入库任务开始 ==================")
 	if m.dbStore == nil {
 		m.logger.Println("警告：数据库存储未初始化，跳过。")
@@ -119,6 +129,36 @@ func (m *mongoIngestor) Sync(ctx context.Context, finalLibraryPath string, creat
 	m.logger.Printf("接收到 %d 个系列名，%d 个文件名。", len(createdSeries), len(processedFileNames))
 	m.logger.Println("--- 数据库同步完成 ---")
 	return overwrittenFiles, nil
+}
+
+func (m *mongoIngestor) RebuildFromLibrary(ctx context.Context, finalLibraryPath string) (RebuildStats, error) {
+	if recorder, ok := runstate.FromContext(ctx); ok {
+		m.recorder = recorder
+	}
+	m.logger.Println("================== 从最终库补齐数据库任务开始 ==================")
+	if m.dbStore == nil {
+		return RebuildStats{}, errors.New("数据库存储未初始化")
+	}
+	seriesPaths, err := discoverFinalSeriesPaths(ctx, finalLibraryPath, m.scannerCfg)
+	if err != nil {
+		return RebuildStats{}, err
+	}
+	m.logger.Printf("发现 %d 个最终库系列目录。", len(seriesPaths))
+	seriesCache, err := m.processAllSeries(ctx, seriesPaths)
+	if err != nil {
+		return RebuildStats{}, fmt.Errorf("处理系列时失败: %w", err)
+	}
+	_, mediaStats, err := m.processAllMedia(ctx, seriesPaths, seriesCache)
+	if err != nil {
+		return RebuildStats{}, fmt.Errorf("处理媒体时失败: %w", err)
+	}
+	if err := m.updateAllSeriesMetadata(ctx, seriesCache); err != nil {
+		return RebuildStats{}, fmt.Errorf("更新系列元数据失败: %w", err)
+	}
+	if err := m.reconcileAndValidateSeries(ctx, seriesCache); err != nil {
+		return RebuildStats{}, fmt.Errorf("最终数量校验失败: %w", err)
+	}
+	return RebuildStats{Series: len(seriesCache), Media: mediaStats.Written}, nil
 }
 
 func (m *mongoIngestor) collectFinalSeriesPaths(finalLibraryPath string, changelog map[string]string) []string {
@@ -228,6 +268,7 @@ type mediaJob struct {
 }
 type mediaResult struct {
 	writeModel      mongo.WriteModel
+	mediaType       string
 	overwrittenPath string
 	err             error
 }
@@ -290,7 +331,8 @@ func (m *mongoIngestor) processAllMedia(ctx context.Context, seriesPaths []strin
 	}()
 
 	var allOverwritten []string
-	var writeModels []mongo.WriteModel
+	writeModelsByType := make(map[string][]mongo.WriteModel)
+	preparedCount := 0
 	done := make(chan []error, 1)
 
 	go func() {
@@ -301,7 +343,12 @@ func (m *mongoIngestor) processAllMedia(ctx context.Context, seriesPaths []strin
 				continue
 			}
 			if res.writeModel != nil {
-				writeModels = append(writeModels, res.writeModel)
+				mediaType := strings.TrimSpace(res.mediaType)
+				if mediaType == "" {
+					mediaType = "unknown"
+				}
+				writeModelsByType[mediaType] = append(writeModelsByType[mediaType], res.writeModel)
+				preparedCount++
 			}
 			if res.overwrittenPath != "" {
 				allOverwritten = append(allOverwritten, res.overwrittenPath)
@@ -320,7 +367,7 @@ func (m *mongoIngestor) processAllMedia(ctx context.Context, seriesPaths []strin
 	}
 	allErrs = append(allErrs, resultErrs...)
 
-	stats := mediaProcessStats{Scheduled: scheduled, Prepared: len(writeModels)}
+	stats := mediaProcessStats{Scheduled: scheduled, Prepared: preparedCount}
 	if len(allErrs) > 0 {
 		return allOverwritten, stats, errors.Join(allErrs...)
 	}
@@ -328,16 +375,34 @@ func (m *mongoIngestor) processAllMedia(ctx context.Context, seriesPaths []strin
 		return allOverwritten, stats, fmt.Errorf("入库模型数量不一致: 待处理 %d, 已准备 %d", stats.Scheduled, stats.Prepared)
 	}
 
-	for start := 0; start < len(writeModels); start += m.batchSize {
-		end := start + m.batchSize
-		if end > len(writeModels) {
-			end = len(writeModels)
+	mediaTypes := make([]string, 0, len(writeModelsByType))
+	for mediaType := range writeModelsByType {
+		mediaTypes = append(mediaTypes, mediaType)
+	}
+	sort.Strings(mediaTypes)
+	for _, mediaType := range mediaTypes {
+		writeModels := writeModelsByType[mediaType]
+		targetStore := m.dbStore.Images()
+		if typedStore, ok := m.dbStore.(interface {
+			Media(string) database.ImageStore
+		}); ok {
+			targetStore = typedStore.Media(mediaType)
 		}
-		if err := m.dbStore.Images().BulkWrite(ctx, writeModels[start:end]); err != nil {
-			m.logger.Printf("错误: 批量写入媒体失败: %v", err)
-			return allOverwritten, stats, err
+		for start := 0; start < len(writeModels); start += m.batchSize {
+			end := start + m.batchSize
+			if end > len(writeModels) {
+				end = len(writeModels)
+			}
+			counts := map[string]int64{"batchSize": int64(end - start)}
+			m.record(runstate.Event{Phase: "database_sync", Action: "media_bulk_write_before", Counts: counts, Metadata: map[string]string{"mediaType": mediaType}})
+			if err := targetStore.BulkWrite(ctx, writeModels[start:end]); err != nil {
+				m.logger.Printf("错误: 批量写入媒体失败: type=%s error=%v", mediaType, err)
+				m.record(runstate.Event{Phase: "database_sync", Action: "media_bulk_write_after", Status: "failed", Error: err.Error(), Counts: counts, Metadata: map[string]string{"mediaType": mediaType}})
+				return allOverwritten, stats, err
+			}
+			m.record(runstate.Event{Phase: "database_sync", Action: "media_bulk_write_after", Status: "written", Counts: counts, Metadata: map[string]string{"mediaType": mediaType}})
+			stats.Written += end - start
 		}
-		stats.Written += end - start
 	}
 
 	return allOverwritten, stats, nil
@@ -429,6 +494,7 @@ func (m *mongoIngestor) processMediaJob(ctx context.Context, job mediaJob, resul
 		return
 	}
 	series := job.series
+	m.record(runstate.Event{Phase: "database_sync", Action: "media_before_upsert", Source: filePath, Metadata: map[string]string{"series": series.Name, "fileName": fileName, "mediaType": mediaType}})
 
 	filter := bson.M{
 		"seriesId": series.ID,
@@ -454,7 +520,8 @@ func (m *mongoIngestor) processMediaJob(ctx context.Context, job mediaJob, resul
 	}
 	model := mongo.NewUpdateOneModel().SetFilter(filter).SetUpsert(true).SetUpdate(update)
 
-	m.sendMediaResult(ctx, results, mediaResult{writeModel: model})
+	m.sendMediaResult(ctx, results, mediaResult{writeModel: model, mediaType: mediaType})
+	m.record(runstate.Event{Phase: "database_sync", Action: "media_after_prepare", Source: filePath, Status: "prepared", Metadata: map[string]string{"series": series.Name, "fileName": fileName}})
 }
 
 func (m *mongoIngestor) sendMediaResult(ctx context.Context, results chan<- mediaResult, result mediaResult) {
@@ -504,8 +571,12 @@ func (m *mongoIngestor) updateAllSeriesMetadata(ctx context.Context, seriesCache
 
 	if len(writes) > 0 {
 		m.logger.Printf("准备批量更新 %d 个系列的元数据...", len(writes))
+		m.record(runstate.Event{Phase: "database_sync", Action: "series_metadata_bulk_write_before", Counts: map[string]int64{"batchSize": int64(len(writes))}})
 		if err := m.dbStore.Series().BulkWrite(ctx, writes); err != nil {
 			allErrs = append(allErrs, err)
+			m.record(runstate.Event{Phase: "database_sync", Action: "series_metadata_bulk_write_after", Status: "failed", Error: err.Error(), Counts: map[string]int64{"batchSize": int64(len(writes))}})
+		} else {
+			m.record(runstate.Event{Phase: "database_sync", Action: "series_metadata_bulk_write_after", Status: "written", Counts: map[string]int64{"batchSize": int64(len(writes))}})
 		}
 	}
 
@@ -575,8 +646,12 @@ func (m *mongoIngestor) reconcileAndValidateSeries(ctx context.Context, seriesCa
 				continue
 			}
 			m.logger.Printf("删除数据库中已不存在的媒体记录: series=%s file=%s", series.Name, item.FileName)
+			m.record(runstate.Event{Phase: "database_sync", Action: "media_before_delete_missing", Source: item.FilePath, Metadata: map[string]string{"series": series.Name, "fileName": item.FileName}})
 			if err := m.dbStore.Images().Delete(ctx, item.ID); err != nil {
 				allErrs = append(allErrs, fmt.Errorf("删除缺失媒体记录 %s/%s 失败: %w", series.Name, item.FileName, err))
+				m.record(runstate.Event{Phase: "database_sync", Action: "media_after_delete_missing", Source: item.FilePath, Status: "failed", Error: err.Error(), Metadata: map[string]string{"series": series.Name, "fileName": item.FileName}})
+			} else {
+				m.record(runstate.Event{Phase: "database_sync", Action: "media_after_delete_missing", Source: item.FilePath, Status: "deleted", Metadata: map[string]string{"series": series.Name, "fileName": item.FileName}})
 			}
 		}
 
@@ -591,6 +666,18 @@ func (m *mongoIngestor) reconcileAndValidateSeries(ctx context.Context, seriesCa
 	}
 
 	return errors.Join(allErrs...)
+}
+
+func recorderFromContext(ctx context.Context) runstate.Recorder {
+	recorder, _ := runstate.FromContext(ctx)
+	return recorder
+}
+
+func (m *mongoIngestor) record(event runstate.Event) {
+	if m.recorder.Store == nil || m.recorder.RunID == "" {
+		return
+	}
+	m.recorder.Event(context.Background(), event)
 }
 
 func mediaFileNamesInDir(dir string, scannerCfg config.ScannerConfig) (map[string]struct{}, error) {
@@ -626,6 +713,63 @@ func mediaFilesInDir(dir string, scannerCfg config.ScannerConfig) ([]string, err
 	})
 	if err != nil {
 		return nil, err
+	}
+	return files, nil
+}
+
+func discoverFinalSeriesPaths(ctx context.Context, finalLibraryPath string, scannerCfg config.ScannerConfig) ([]string, error) {
+	pathSet := make(map[string]struct{})
+	err := filepath.WalkDir(finalLibraryPath, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		if entry.Name() == sameNameDirName {
+			return filepath.SkipDir
+		}
+		if path == finalLibraryPath {
+			return nil
+		}
+		files, err := directMediaFilesInDir(path, scannerCfg)
+		if err != nil {
+			return err
+		}
+		if len(files) > 0 {
+			pathSet[path] = struct{}{}
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(pathSet))
+	for path := range pathSet {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func directMediaFilesInDir(dir string, scannerCfg config.ScannerConfig) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if detectMediaType(entry.Name(), scannerCfg) == "unknown" {
+			continue
+		}
+		files = append(files, entry.Name())
 	}
 	return files, nil
 }

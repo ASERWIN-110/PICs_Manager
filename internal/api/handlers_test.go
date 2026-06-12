@@ -5,6 +5,7 @@ import (
 	"PICs_Manager/internal/models"
 	"PICs_Manager/internal/task"
 	"PICs_Manager/pkg/database"
+	"PICs_Manager/pkg/runstate"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -26,7 +27,7 @@ type captureRunner struct {
 }
 
 func TestRegisterRoutesAllowsLocalDevOrigins(t *testing.T) {
-	router := RegisterRoutes(nil, nil)
+	router := RegisterRoutesWithRunStore(nil, nil)
 	for _, origin := range []string{"http://localhost:5173", "http://127.0.0.1:5173"} {
 		t.Run(origin, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, "/api/v1/series", nil)
@@ -46,8 +47,105 @@ func TestRegisterRoutesAllowsLocalDevOrigins(t *testing.T) {
 	}
 }
 
+func TestMaintenanceRoutesRequireTokenWhenConfigured(t *testing.T) {
+	oldConfig := config.C
+	config.C = &config.Config{Server: config.ServerConfig{MaintenanceToken: "secret"}}
+	defer func() { config.C = oldConfig }()
+
+	router := RegisterRoutesWithRunStore(task.NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{}), nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read-only health endpoint should remain open, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks", strings.NewReader(`{"path":"/tmp/media","mode":"classifyOnly"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized maintenance request, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks", strings.NewReader(`{"path":"/tmp/media","mode":"classifyOnly"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Maintenance-Token", "secret")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected accepted maintenance request, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSafeConfigRedactsMaintenanceToken(t *testing.T) {
+	safe := safeConfigForResponse(&config.Config{Server: config.ServerConfig{MaintenanceToken: "secret"}})
+	if safe.Server.MaintenanceToken != "xxxxx" {
+		t.Fatalf("expected redacted maintenance token, got %q", safe.Server.MaintenanceToken)
+	}
+}
+
+func TestRunHandlersExposePersistentRunState(t *testing.T) {
+	store, err := runstate.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	if err := store.Create(context.Background(), runstate.Run{
+		ID:       "run-1",
+		Status:   runstate.StatusCompleted,
+		Mode:     "classifyOnly",
+		Phase:    "finished",
+		ScanPath: "/media/inbox",
+		Counts:   map[string]int64{"classifiedFiles": 3},
+	}); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	if err := store.AppendEvent(context.Background(), runstate.Event{RunID: "run-1", Action: "checkpoint", Phase: "finished"}); err != nil {
+		t.Fatalf("AppendEvent returned error: %v", err)
+	}
+	router := RegisterRoutesWithRunStore(nil, nil, store)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs", nil)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "run-1") {
+		t.Fatalf("unexpected list response status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/runs/run-1/journal", nil)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "checkpoint") {
+		t.Fatalf("unexpected journal response status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleStopTaskCancelsRunningTask(t *testing.T) {
+	runner := taskBlockingRunner{ctxs: make(chan context.Context, 1)}
+	manager := task.NewManagerWithRunStore(runner, &config.Config{})
+	taskID, err := manager.StartNewScanTask("/tmp/media", "classifyOnly")
+	if err != nil {
+		t.Fatalf("StartNewScanTask returned error: %v", err)
+	}
+	select {
+	case <-runner.ctxs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scan context")
+	}
+	router := RegisterRoutesWithRunStore(manager, nil, nil)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/tasks/"+taskID, nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestRegisterRoutesHealthEndpoint(t *testing.T) {
-	router := RegisterRoutes(nil, nil)
+	router := RegisterRoutesWithRunStore(nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 
@@ -62,7 +160,7 @@ func TestRegisterRoutesHealthEndpoint(t *testing.T) {
 }
 
 func TestRegisterRoutesDoesNotExposeLegacyScanTaskPath(t *testing.T) {
-	router := RegisterRoutes(nil, nil)
+	router := RegisterRoutesWithRunStore(nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/scan", bytes.NewBufferString(`{"path":"/tmp/media","mode":"full"}`))
 	rec := httptest.NewRecorder()
 
@@ -130,6 +228,53 @@ func TestListResponsesDoNotInlineBase64Thumbnails(t *testing.T) {
 	}
 	if strings.Contains(string(emptyMediaPayload), "thumbnailUrl") {
 		t.Fatalf("media without thumbnail flag should not include thumbnail URL: %s", emptyMediaPayload)
+	}
+	videoPayload, err := json.Marshal(toMediaResponses([]models.Image{{
+		ID:           primitive.NewObjectID(),
+		SeriesID:     seriesID,
+		MediaType:    "video",
+		Thumbnail:    "data:image/jpeg;base64,abcd",
+		HasThumbnail: true,
+	}}))
+	if err != nil {
+		t.Fatalf("Marshal video media response returned error: %v", err)
+	}
+	if strings.Contains(string(videoPayload), "thumbnailUrl") {
+		t.Fatalf("non-image media should not include thumbnail URL: %s", videoPayload)
+	}
+}
+
+func TestListMediaBySeriesSeparatesMediaTypes(t *testing.T) {
+	seriesID := primitive.NewObjectID()
+	store := &apiTypedMediaStore{}
+	router := RegisterRoutesWithRunStore(nil, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/series/"+seriesID.Hex()+"/media/video?page=1&limit=20", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if len(store.requestedMediaTypes) != 1 || store.requestedMediaTypes[0] != "video" {
+		t.Fatalf("expected video media store request, got %#v", store.requestedMediaTypes)
+	}
+	if !strings.Contains(rec.Body.String(), `"mediaType":"video"`) {
+		t.Fatalf("expected video response, got %s", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/series/"+seriesID.Hex()+"/images?page=1&limit=20", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if len(store.requestedMediaTypes) != 2 || store.requestedMediaTypes[1] != "image" {
+		t.Fatalf("expected legacy images route to request image store, got %#v", store.requestedMediaTypes)
+	}
+	if !strings.Contains(rec.Body.String(), `"mediaType":"image"`) {
+		t.Fatalf("expected image response, got %s", rec.Body.String())
 	}
 }
 
@@ -208,7 +353,7 @@ func TestParseCursorPaginationCapsLimit(t *testing.T) {
 }
 
 func TestHandleSearchByImageRejectsOversizedUpload(t *testing.T) {
-	handlers := NewAPIHandlers(nil, nil)
+	handlers := NewAPIHandlersWithRunStore(nil, nil)
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("image", "large.png")
@@ -241,7 +386,7 @@ func TestHandleSearchByImageRejectsOversizedUpload(t *testing.T) {
 }
 
 func TestHandleSearchByImageRejectsInvalidImageUpload(t *testing.T) {
-	handlers := NewAPIHandlers(nil, apiFakeStore{})
+	handlers := NewAPIHandlersWithRunStore(nil, apiFakeStore{})
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("image", "not-image.txt")
@@ -311,7 +456,7 @@ func TestOrderSeriesByIDsPreservesSimilarityOrder(t *testing.T) {
 }
 
 func TestDatabaseHandlersReturnUnavailableWithoutDB(t *testing.T) {
-	handlers := NewAPIHandlers(nil, nil)
+	handlers := NewAPIHandlersWithRunStore(nil, nil)
 	tests := []struct {
 		name   string
 		method string
@@ -358,8 +503,18 @@ func (r captureRunner) RunFullScanContext(ctx context.Context, cfg config.Scanne
 	return nil
 }
 
+type taskBlockingRunner struct {
+	ctxs chan context.Context
+}
+
+func (r taskBlockingRunner) RunFullScanContext(ctx context.Context, cfg config.ScannerConfig) error {
+	r.ctxs <- ctx
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 func TestHandleStartScanTaskReturnsBadRequestForInvalidMode(t *testing.T) {
-	handlers := NewAPIHandlers(task.NewManager(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{}), nil)
+	handlers := NewAPIHandlersWithRunStore(task.NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{}), nil)
 	body := bytes.NewBufferString(`{"path":"/tmp/media","mode":"bad"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", body)
 	rec := httptest.NewRecorder()
@@ -379,7 +534,7 @@ func TestHandleStartScanTaskReturnsBadRequestForInvalidMode(t *testing.T) {
 }
 
 func TestHandleStartScanTaskReturnsUnavailableWithoutTaskManager(t *testing.T) {
-	handlers := NewAPIHandlers(nil, nil)
+	handlers := NewAPIHandlersWithRunStore(nil, nil)
 	body := bytes.NewBufferString(`{"path":"/tmp/media","mode":"full"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", body)
 	rec := httptest.NewRecorder()
@@ -399,7 +554,7 @@ func TestHandleStartScanTaskReturnsUnavailableWithoutTaskManager(t *testing.T) {
 }
 
 func TestHandleStartScanTaskReturnsUnavailableWithoutRunner(t *testing.T) {
-	handlers := NewAPIHandlers(task.NewManager(nil, &config.Config{}), nil)
+	handlers := NewAPIHandlersWithRunStore(task.NewManagerWithRunStore(nil, &config.Config{}), nil)
 	body := bytes.NewBufferString(`{"path":"/tmp/media","mode":"full"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", body)
 	rec := httptest.NewRecorder()
@@ -419,11 +574,11 @@ func TestHandleStartScanTaskReturnsUnavailableWithoutRunner(t *testing.T) {
 }
 
 func TestHandleStartScanTaskReturnsUnavailableWhenShuttingDown(t *testing.T) {
-	manager := task.NewManager(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{})
+	manager := task.NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{})
 	if err := manager.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown returned error: %v", err)
 	}
-	handlers := NewAPIHandlers(manager, nil)
+	handlers := NewAPIHandlersWithRunStore(manager, nil)
 	body := bytes.NewBufferString(`{"path":"/tmp/media","mode":"full"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", body)
 	rec := httptest.NewRecorder()
@@ -449,8 +604,8 @@ func TestHandleUpdateConfigWritesFileAndUpdatesTaskManagerConfig(t *testing.T) {
 	runner := captureRunner{cfgs: make(chan config.ScannerConfig, 1)}
 	initial := &config.Config{Scanner: config.ScannerConfig{Mode: "full"}}
 	config.C = initial
-	manager := task.NewManager(runner, initial)
-	handlers := NewAPIHandlers(manager, nil)
+	manager := task.NewManagerWithRunStore(runner, initial)
+	handlers := NewAPIHandlersWithRunStore(manager, nil)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	handlers.configPath = configPath
 
@@ -509,7 +664,7 @@ func TestHandleGetConfigRedactsDatabasePassword(t *testing.T) {
 			FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`},
 		},
 	}
-	handlers := NewAPIHandlers(nil, nil)
+	handlers := NewAPIHandlersWithRunStore(nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	rec := httptest.NewRecorder()
 
@@ -540,7 +695,7 @@ func TestHandleUpdateConfigPreservesRuntimeSecretAndWritesSanitizedURI(t *testin
 			FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`},
 		},
 	}
-	handlers := NewAPIHandlers(task.NewManager(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, config.C), nil)
+	handlers := NewAPIHandlersWithRunStore(task.NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, config.C), nil)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	handlers.configPath = configPath
 
@@ -620,7 +775,7 @@ func TestHandleUpdateConfigRejectsInvalidScannerConfig(t *testing.T) {
 	t.Cleanup(func() { config.C = oldConfig })
 
 	config.C = &config.Config{Scanner: config.ScannerConfig{Mode: "full"}}
-	handlers := NewAPIHandlers(task.NewManager(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, config.C), nil)
+	handlers := NewAPIHandlersWithRunStore(task.NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, config.C), nil)
 	handlers.configPath = filepath.Join(t.TempDir(), "config.yaml")
 
 	payload, err := json.Marshal(config.Config{
@@ -673,6 +828,7 @@ type apiFakeStore struct{}
 
 func (s apiFakeStore) Series() database.SeriesStore        { return apiFakeSeriesStore{} }
 func (s apiFakeStore) Images() database.ImageStore         { return apiFakeImageStore{} }
+func (s apiFakeStore) Media(string) database.ImageStore    { return apiFakeImageStore{} }
 func (s apiFakeStore) EnsureIndexes(context.Context) error { return nil }
 func (s apiFakeStore) Diagnostics(context.Context) (database.Diagnostics, error) {
 	return database.Diagnostics{}, nil
@@ -720,4 +876,29 @@ func (s apiFakeImageStore) GetFirstThumbnailMedia(context.Context, primitive.Obj
 }
 func (s apiFakeImageStore) GetAllBySeriesID(context.Context, primitive.ObjectID) ([]models.Image, error) {
 	return nil, nil
+}
+
+type apiTypedMediaStore struct {
+	apiFakeStore
+	requestedMediaTypes []string
+}
+
+func (s *apiTypedMediaStore) Media(mediaType string) database.ImageStore {
+	s.requestedMediaTypes = append(s.requestedMediaTypes, mediaType)
+	return apiTypedImageStore{mediaType: mediaType}
+}
+
+type apiTypedImageStore struct {
+	apiFakeImageStore
+	mediaType string
+}
+
+func (s apiTypedImageStore) ListBySeriesIDCursor(_ context.Context, seriesID primitive.ObjectID, _ string, _ int) ([]models.Image, int64, string, error) {
+	return []models.Image{{
+		ID:        primitive.NewObjectID(),
+		SeriesID:  seriesID,
+		MediaType: s.mediaType,
+		FileName:  s.mediaType + "-item",
+		FilePath:  "/library/" + s.mediaType + "-item",
+	}}, 1, "", nil
 }

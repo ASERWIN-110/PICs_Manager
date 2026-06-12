@@ -7,6 +7,8 @@ import (
 	"PICs_Manager/internal/task"
 	"PICs_Manager/pkg/database"
 	"PICs_Manager/pkg/hasher"
+	"PICs_Manager/pkg/runstate"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,16 +34,51 @@ const maxImageSearchUploadBytes int64 = 10 << 20
 type APIHandlers struct {
 	taskManager *task.Manager
 	db          database.Store
+	runs        *runstate.Store
 	configPath  string
 }
 
-// NewAPIHandlers 创建一个新的API处理器实例
-func NewAPIHandlers(tm *task.Manager, db database.Store) *APIHandlers {
+// NewAPIHandlersWithRunStore 创建一个新的API处理器实例。
+func NewAPIHandlersWithRunStore(tm *task.Manager, db database.Store, runStores ...*runstate.Store) *APIHandlers {
+	var runs *runstate.Store
+	if len(runStores) > 0 {
+		runs = runStores[0]
+	}
 	return &APIHandlers{
 		taskManager: tm,
 		db:          db,
+		runs:        runs,
 		configPath:  "config.yaml",
 	}
+}
+
+func (h *APIHandlers) RequireMaintenanceAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := ""
+		if config.C != nil {
+			token = strings.TrimSpace(config.C.Server.MaintenanceToken)
+		}
+		if token == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(requestMaintenanceToken(r))) != 1 {
+			respondError(w, http.StatusUnauthorized, "maintenance_auth_required", "维护接口需要有效 token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requestMaintenanceToken(r *http.Request) string {
+	if value := strings.TrimSpace(r.Header.Get("X-Maintenance-Token")); value != "" {
+		return value
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[len("Bearer "):])
+	}
+	return ""
 }
 
 // --- 辅助函数 ---
@@ -125,7 +162,7 @@ func toMediaResponses(items []models.Image) []mediaResponse {
 			CreatedAt:      item.CreatedAt,
 			UpdatedAt:      item.UpdatedAt,
 		}
-		if item.HasThumbnail {
+		if item.HasThumbnail && isImageMediaType(item.MediaType) {
 			response.ThumbnailURL = "/api/v1/images/" + item.ID.Hex() + "/thumbnail"
 		}
 		result[idx] = response
@@ -282,6 +319,89 @@ func (h *APIHandlers) HandleGetTaskStatus(w http.ResponseWriter, r *http.Request
 	respondJSON(w, http.StatusOK, status)
 }
 
+func (h *APIHandlers) HandleStopTask(w http.ResponseWriter, r *http.Request) {
+	h.handleCancelTask(w, r, h.taskManager.StopTask)
+}
+
+func (h *APIHandlers) HandlePauseTask(w http.ResponseWriter, r *http.Request) {
+	h.handleCancelTask(w, r, h.taskManager.PauseTask)
+}
+
+func (h *APIHandlers) handleCancelTask(w http.ResponseWriter, r *http.Request, cancel func(string) (*task.Task, error)) {
+	if h.taskManager == nil {
+		respondError(w, http.StatusServiceUnavailable, "task_manager_unavailable", "任务管理器未初始化")
+		return
+	}
+	taskID := chi.URLParam(r, "taskId")
+	status, err := cancel(taskID)
+	if err != nil {
+		if errors.Is(err, task.ErrTaskNotFound) {
+			respondError(w, http.StatusNotFound, "task_not_found", err.Error())
+			return
+		}
+		if errors.Is(err, task.ErrInvalidInput) {
+			respondError(w, http.StatusBadRequest, "invalid_task", err.Error())
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "task_stop_failed", err.Error())
+		return
+	}
+	respondJSON(w, http.StatusAccepted, status)
+}
+
+func (h *APIHandlers) HandleListRuns(w http.ResponseWriter, r *http.Request) {
+	if h.runs == nil {
+		respondError(w, http.StatusServiceUnavailable, "run_store_unavailable", "运行状态存储未初始化")
+		return
+	}
+	limit, err := parsePositiveQueryInt(r, "limit", 50)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid_limit", err.Error())
+		return
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	runs, err := h.runs.List(r.Context(), limit)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "run_list_failed", err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, runs)
+}
+
+func (h *APIHandlers) HandleGetRun(w http.ResponseWriter, r *http.Request) {
+	if h.runs == nil {
+		respondError(w, http.StatusServiceUnavailable, "run_store_unavailable", "运行状态存储未初始化")
+		return
+	}
+	runID := strings.TrimSpace(chi.URLParam(r, "runId"))
+	run, err := h.runs.Get(r.Context(), runID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "run_lookup_failed", err.Error())
+		return
+	}
+	if run == nil {
+		respondError(w, http.StatusNotFound, "run_not_found", "运行记录不存在")
+		return
+	}
+	respondJSON(w, http.StatusOK, run)
+}
+
+func (h *APIHandlers) HandleGetRunJournal(w http.ResponseWriter, r *http.Request) {
+	if h.runs == nil {
+		respondError(w, http.StatusServiceUnavailable, "run_store_unavailable", "运行状态存储未初始化")
+		return
+	}
+	runID := strings.TrimSpace(chi.URLParam(r, "runId"))
+	events, err := h.runs.Journal(r.Context(), runID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "run_journal_failed", err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, events)
+}
+
 // --- 系列处理器 ---
 
 func (h *APIHandlers) HandleListSeries(w http.ResponseWriter, r *http.Request) {
@@ -323,12 +443,24 @@ func (h *APIHandlers) HandleListMediaBySeries(w http.ResponseWriter, r *http.Req
 		respondError(w, http.StatusBadRequest, "cursor_required", "page 大于 1 时必须提供 cursor")
 		return
 	}
-	media, total, nextCursor, err := h.db.Images().ListBySeriesIDCursor(r.Context(), seriesID, cursor, limit)
+	mediaType := requestedMediaType(r)
+	media, total, nextCursor, err := h.db.Media(mediaType).ListBySeriesIDCursor(r.Context(), seriesID, cursor, limit)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "series_images_failed", "无法获取媒体列表: "+err.Error())
 		return
 	}
 	respondList(w, http.StatusOK, toMediaResponses(media), makeCursorPagination(page, limit, total, nextCursor))
+}
+
+func requestedMediaType(r *http.Request) string {
+	mediaType := strings.TrimSpace(chi.URLParam(r, "mediaType"))
+	if mediaType == "" {
+		mediaType = strings.TrimSpace(r.URL.Query().Get("mediaType"))
+	}
+	if mediaType == "" {
+		return "image"
+	}
+	return mediaType
 }
 
 func (h *APIHandlers) HandleSeriesThumbnail(w http.ResponseWriter, r *http.Request) {
@@ -366,11 +498,16 @@ func (h *APIHandlers) HandleMediaThumbnail(w http.ResponseWriter, r *http.Reques
 		respondError(w, http.StatusInternalServerError, "image_lookup_failed", "获取媒体失败: "+err.Error())
 		return
 	}
-	if image == nil || image.Thumbnail == "" {
+	if image == nil || !isImageMediaType(image.MediaType) || image.Thumbnail == "" {
 		respondError(w, http.StatusNotFound, "thumbnail_not_found", "媒体缩略图不存在")
 		return
 	}
 	serveThumbnail(w, image.Thumbnail)
+}
+
+func isImageMediaType(mediaType string) bool {
+	mediaType = strings.TrimSpace(mediaType)
+	return mediaType == "" || strings.EqualFold(mediaType, "image")
 }
 
 func serveThumbnail(w http.ResponseWriter, thumbnail string) {
@@ -545,6 +682,9 @@ func (h *APIHandlers) HandleUpdateConfig(w http.ResponseWriter, r *http.Request)
 	if isRedactedURI(runtimeConfig.Database.URI) && config.C != nil {
 		runtimeConfig.Database.URI = config.C.Database.URI
 	}
+	if runtimeConfig.Server.MaintenanceToken == "xxxxx" && config.C != nil {
+		runtimeConfig.Server.MaintenanceToken = config.C.Server.MaintenanceToken
+	}
 	fileConfig := runtimeConfig
 	fileConfig.Database.URI = sanitizeURIForConfigFile(fileConfig.Database.URI)
 
@@ -581,6 +721,9 @@ func safeConfigForResponse(cfg *config.Config) *config.Config {
 	}
 	safe := *cfg
 	safe.Database.URI = redactURISecret(safe.Database.URI)
+	if safe.Server.MaintenanceToken != "" {
+		safe.Server.MaintenanceToken = "xxxxx"
+	}
 	return &safe
 }
 

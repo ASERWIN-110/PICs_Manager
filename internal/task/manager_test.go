@@ -2,6 +2,7 @@ package task
 
 import (
 	"PICs_Manager/config"
+	"PICs_Manager/pkg/runstate"
 	"context"
 	"errors"
 	"strings"
@@ -46,7 +47,7 @@ func (r blockingRunner) RunFullScanContext(ctx context.Context, cfg config.Scann
 }
 
 func TestScanTaskFailureIsReported(t *testing.T) {
-	manager := NewManager(failingRunner{}, &config.Config{})
+	manager := NewManagerWithRunStore(failingRunner{}, &config.Config{})
 
 	taskID, err := manager.StartNewScanTask("/tmp/media", "full")
 	if err != nil {
@@ -86,7 +87,7 @@ func waitForTaskStatus(t *testing.T, manager *Manager, taskID string, want TaskS
 }
 
 func TestStartNewScanTaskRejectsInvalidMode(t *testing.T) {
-	manager := NewManager(failingRunner{}, &config.Config{})
+	manager := NewManagerWithRunStore(failingRunner{}, &config.Config{})
 
 	_, err := manager.StartNewScanTask("/tmp/media", "bad")
 	if !errors.Is(err, ErrInvalidInput) {
@@ -98,7 +99,7 @@ func TestStartNewScanTaskRejectsInvalidMode(t *testing.T) {
 }
 
 func TestStartNewScanTaskRejectsMissingPath(t *testing.T) {
-	manager := NewManager(failingRunner{}, &config.Config{})
+	manager := NewManagerWithRunStore(failingRunner{}, &config.Config{})
 
 	_, err := manager.StartNewScanTask("  ", "full")
 	if !errors.Is(err, ErrInvalidInput) {
@@ -107,7 +108,7 @@ func TestStartNewScanTaskRejectsMissingPath(t *testing.T) {
 }
 
 func TestStartNewScanTaskRejectsMissingRunner(t *testing.T) {
-	manager := NewManager(nil, &config.Config{})
+	manager := NewManagerWithRunStore(nil, &config.Config{})
 
 	_, err := manager.StartNewScanTask("/tmp/media", "full")
 	if !errors.Is(err, ErrNoRunner) {
@@ -115,10 +116,22 @@ func TestStartNewScanTaskRejectsMissingRunner(t *testing.T) {
 	}
 }
 
+func TestStartNewScanTaskRejectsStoppingOrPausingTask(t *testing.T) {
+	for _, status := range []TaskStatus{StatusStopping, StatusPausing} {
+		manager := NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{})
+		manager.tasks["existing"] = &Task{ID: "existing", Status: status, StartTime: time.Now()}
+
+		_, err := manager.StartNewScanTask("/tmp/media", "classifyOnly")
+		if !errors.Is(err, ErrTaskConflict) {
+			t.Fatalf("status %s: expected ErrTaskConflict, got %v", status, err)
+		}
+	}
+}
+
 func TestUpdateConfigAffectsFutureDefaultMode(t *testing.T) {
 	runner := captureRunner{cfgs: make(chan config.ScannerConfig, 1)}
 	cfg := &config.Config{Scanner: config.ScannerConfig{Mode: "full"}}
-	manager := NewManager(runner, cfg)
+	manager := NewManagerWithRunStore(runner, cfg)
 	manager.UpdateConfig(config.Config{Scanner: config.ScannerConfig{Mode: " classifyOnly "}})
 
 	taskID, err := manager.StartNewScanTask("/tmp/media", "")
@@ -142,7 +155,7 @@ func TestRunScanUsesContextAwareRunnerWhenAvailable(t *testing.T) {
 		cfgs: make(chan config.ScannerConfig, 1),
 		ctxs: make(chan context.Context, 1),
 	}
-	manager := NewManager(runner, &config.Config{})
+	manager := NewManagerWithRunStore(runner, &config.Config{})
 
 	taskID, err := manager.StartNewScanTask("/tmp/media", "classifyOnly")
 	if err != nil {
@@ -174,7 +187,7 @@ func TestRunScanUsesContextAwareRunnerWhenAvailable(t *testing.T) {
 }
 
 func TestFinishedTaskHistoryIsBounded(t *testing.T) {
-	manager := NewManager(failingRunner{}, &config.Config{})
+	manager := NewManagerWithRunStore(failingRunner{}, &config.Config{})
 	taskIDs := make([]string, 0, maxFinishedTaskHistory+5)
 
 	for i := 0; i < maxFinishedTaskHistory+5; i++ {
@@ -201,9 +214,75 @@ func TestFinishedTaskHistoryIsBounded(t *testing.T) {
 	}
 }
 
+func TestFinishedTaskHistoryIncludesStoppedAndPausedTasks(t *testing.T) {
+	manager := NewManagerWithRunStore(nil, &config.Config{})
+	now := time.Now()
+	for i := 0; i < maxFinishedTaskHistory+6; i++ {
+		status := StatusStopped
+		if i%2 == 0 {
+			status = StatusPaused
+		}
+		endTime := now.Add(time.Duration(i) * time.Second)
+		manager.tasks[string(rune('a'+i))] = &Task{
+			ID:        string(rune('a' + i)),
+			Status:    status,
+			StartTime: endTime,
+			EndTime:   &endTime,
+		}
+	}
+
+	manager.mu.Lock()
+	manager.pruneFinishedTasksLocked()
+	taskCount := len(manager.tasks)
+	manager.mu.Unlock()
+
+	if taskCount != maxFinishedTaskHistory {
+		t.Fatalf("expected %d retained terminal tasks, got %d", maxFinishedTaskHistory, taskCount)
+	}
+}
+
+func TestGetTaskStatusMergesPersistedRunProgress(t *testing.T) {
+	store, err := runstate.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	const taskID = "task-1"
+	if err := store.Create(context.Background(), runstate.Run{
+		ID:           taskID,
+		Status:       runstate.StatusRunning,
+		Phase:        "archive_done",
+		Counts:       map[string]int64{"pathChanges": 7},
+		ErrorSummary: []string{"latest warning"},
+	}); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	manager := NewManagerWithRunStore(nil, &config.Config{}, store)
+	manager.tasks[taskID] = &Task{
+		ID:        taskID,
+		Status:    StatusRunning,
+		Phase:     "running",
+		Counts:    map[string]int64{"old": 1},
+		StartTime: time.Now(),
+	}
+
+	status, err := manager.GetTaskStatus(taskID)
+	if err != nil {
+		t.Fatalf("GetTaskStatus returned error: %v", err)
+	}
+	if status.Phase != "archive_done" {
+		t.Fatalf("expected persisted phase, got %+v", status)
+	}
+	if status.Counts["pathChanges"] != 7 || status.Counts["old"] != 0 {
+		t.Fatalf("expected persisted counts, got %+v", status.Counts)
+	}
+	if status.Error != "latest warning" {
+		t.Fatalf("expected persisted error summary, got %q", status.Error)
+	}
+}
+
 func TestShutdownCancelsRunningScanTask(t *testing.T) {
 	runner := blockingRunner{ctxs: make(chan context.Context, 1)}
-	manager := NewManager(runner, &config.Config{})
+	manager := NewManagerWithRunStore(runner, &config.Config{})
 
 	taskID, err := manager.StartNewScanTask("/tmp/media", "full")
 	if err != nil {
@@ -228,14 +307,89 @@ func TestShutdownCancelsRunningScanTask(t *testing.T) {
 		t.Fatal("expected scan context to be canceled")
 	}
 
-	status := waitForTaskStatus(t, manager, taskID, StatusFailed)
-	if !strings.Contains(status.Error, context.Canceled.Error()) {
-		t.Fatalf("expected cancellation error, got %q", status.Error)
+	status := waitForTaskStatus(t, manager, taskID, StatusStopped)
+	if !strings.Contains(status.Error, "停止") {
+		t.Fatalf("expected stopped message, got %q", status.Error)
+	}
+}
+
+func TestStopTaskMarksRunStopped(t *testing.T) {
+	store, err := runstate.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	runner := blockingRunner{ctxs: make(chan context.Context, 1)}
+	manager := NewManagerWithRunStore(runner, &config.Config{}, store)
+
+	taskID, err := manager.StartNewScanTask("/tmp/media", "classifyOnly")
+	if err != nil {
+		t.Fatalf("StartNewScanTask returned error: %v", err)
+	}
+	select {
+	case <-runner.ctxs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scan context")
+	}
+	if _, err := manager.StopTask(taskID); err != nil {
+		t.Fatalf("StopTask returned error: %v", err)
+	}
+	status := waitForTaskStatus(t, manager, taskID, StatusStopped)
+	if !strings.Contains(status.Error, "停止") {
+		t.Fatalf("expected stopped message, got %q", status.Error)
+	}
+	run, err := store.Get(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if run.Status != runstate.StatusStopped {
+		t.Fatalf("expected run stopped, got %+v", run)
+	}
+}
+
+func TestStopTaskRejectsUnknownTask(t *testing.T) {
+	manager := NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{})
+
+	_, err := manager.StopTask("missing")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+func TestPauseTaskMarksRunPaused(t *testing.T) {
+	store, err := runstate.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	runner := blockingRunner{ctxs: make(chan context.Context, 1)}
+	manager := NewManagerWithRunStore(runner, &config.Config{}, store)
+
+	taskID, err := manager.StartNewScanTask("/tmp/media", "classifyOnly")
+	if err != nil {
+		t.Fatalf("StartNewScanTask returned error: %v", err)
+	}
+	select {
+	case <-runner.ctxs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scan context")
+	}
+	if _, err := manager.PauseTask(taskID); err != nil {
+		t.Fatalf("PauseTask returned error: %v", err)
+	}
+	status := waitForTaskStatus(t, manager, taskID, StatusPaused)
+	if !strings.Contains(status.Error, "暂停") {
+		t.Fatalf("expected paused message, got %q", status.Error)
+	}
+	run, err := store.Get(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if run.Status != runstate.StatusPaused {
+		t.Fatalf("expected run paused, got %+v", run)
 	}
 }
 
 func TestShutdownRejectsNewScanTasks(t *testing.T) {
-	manager := NewManager(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{})
+	manager := NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{})
 	if err := manager.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown returned error: %v", err)
 	}
@@ -243,5 +397,72 @@ func TestShutdownRejectsNewScanTasks(t *testing.T) {
 	_, err := manager.StartNewScanTask("/tmp/media", "full")
 	if !errors.Is(err, ErrShuttingDown) {
 		t.Fatalf("expected ErrShuttingDown, got %v", err)
+	}
+}
+
+func TestManagerPersistsRunState(t *testing.T) {
+	store, err := runstate.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	manager := NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{}, store)
+
+	taskID, err := manager.StartNewScanTask("/tmp/media", "classifyOnly")
+	if err != nil {
+		t.Fatalf("StartNewScanTask returned error: %v", err)
+	}
+	waitForTaskStatus(t, manager, taskID, StatusCompleted)
+
+	run, err := store.Get(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if run == nil || run.Status != runstate.StatusCompleted || run.EndedAt == nil {
+		t.Fatalf("unexpected run state: %+v", run)
+	}
+	events, err := store.Journal(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("Journal returned error: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected run journal events")
+	}
+}
+
+func TestManagerRejectsWhenRunStoreLockIsHeld(t *testing.T) {
+	store, err := runstate.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	if err := store.AcquireLock("external"); err != nil {
+		t.Fatalf("AcquireLock returned error: %v", err)
+	}
+	manager := NewManagerWithRunStore(captureRunner{cfgs: make(chan config.ScannerConfig, 1)}, &config.Config{}, store)
+
+	_, err = manager.StartNewScanTask("/tmp/media", "classifyOnly")
+	if !errors.Is(err, ErrTaskConflict) {
+		t.Fatalf("expected ErrTaskConflict, got %v", err)
+	}
+}
+
+func TestManagerRecoverUnfinishedRuns(t *testing.T) {
+	store, err := runstate.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	if err := store.Create(context.Background(), runstate.Run{ID: "run-1", Status: runstate.StatusRunning}); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	manager := NewManagerWithRunStore(nil, &config.Config{}, store)
+
+	if err := manager.RecoverUnfinishedRuns(context.Background()); err != nil {
+		t.Fatalf("RecoverUnfinishedRuns returned error: %v", err)
+	}
+	run, err := store.Get(context.Background(), "run-1")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if run.Status != runstate.StatusInterrupted {
+		t.Fatalf("expected interrupted run, got %+v", run)
 	}
 }

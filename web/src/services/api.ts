@@ -102,9 +102,16 @@ export const fetchSeriesList = async (page: number, limit: number = 20, cursor: 
     );
 };
 
-export const fetchMediaBySeriesId = async (seriesId: string, page: number, limit: number = 60, cursor: string = ''): Promise<SeriesListResponse<MediaItem>> => {
+export const fetchMediaBySeriesId = async (
+    seriesId: string,
+    mediaType: string,
+    page: number,
+    limit: number = 60,
+    cursor: string = '',
+): Promise<SeriesListResponse<MediaItem>> => {
+    const normalizedType = mediaType.trim() || 'image';
     return requestList(
-        apiClient.get<ApiEnvelope<MediaItem[]>>(`/series/${seriesId}/images`, {
+        apiClient.get<ApiEnvelope<MediaItem[]>>(`/series/${seriesId}/media/${encodeURIComponent(normalizedType)}`, {
             params: { page, limit, cursor },
         }),
         '无法加载媒体列表',

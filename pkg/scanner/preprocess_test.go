@@ -1,6 +1,8 @@
 package scanner
 
 import (
+	"PICs_Manager/pkg/runstate"
+	"context"
 	"encoding/base64"
 	"image/color"
 	"os"
@@ -44,6 +46,45 @@ func TestPreprocessorDeletesNumberedCopyWhenHashMatches(t *testing.T) {
 	}
 	if _, err := os.Stat(copyPath); !os.IsNotExist(err) {
 		t.Fatalf("expected same-hash numbered copy to be deleted, err=%v", err)
+	}
+}
+
+func TestPreprocessorRecordsJournalEvents(t *testing.T) {
+	root := t.TempDir()
+	logDir := filepath.Join(root, "logs")
+	sourceDir := filepath.Join(root, "source")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	basePath := filepath.Join(sourceDir, "Series_1.png")
+	copyPath := filepath.Join(sourceDir, "Series_1 (1).png")
+	writeTestPNG(t, basePath)
+	writeTestPNG(t, copyPath)
+
+	store, err := runstate.NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	if err := store.Create(context.Background(), runstate.Run{ID: "run-1"}); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	preprocessor, err := NewPreprocessor(logDir, 1, runstate.Recorder{Store: store, RunID: "run-1"})
+	if err != nil {
+		t.Fatalf("NewPreprocessor returned error: %v", err)
+	}
+	defer preprocessor.Close()
+	if _, err := preprocessor.ProcessDirectory(sourceDir); err != nil {
+		t.Fatalf("ProcessDirectory returned error: %v", err)
+	}
+	events, err := store.Journal(context.Background(), "run-1")
+	if err != nil {
+		t.Fatalf("Journal returned error: %v", err)
+	}
+	if !hasJournalAction(events, "file_after_preprocess") {
+		t.Fatalf("expected preprocess journal event, got %+v", events)
 	}
 }
 

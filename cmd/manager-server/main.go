@@ -7,6 +7,7 @@ import (
 	"PICs_Manager/pkg/database"
 	"PICs_Manager/pkg/database/mongo"
 	"PICs_Manager/pkg/logger"
+	"PICs_Manager/pkg/runstate"
 	"PICs_Manager/pkg/scanner"
 	"context"
 	"errors"
@@ -59,10 +60,21 @@ func main() {
 	}
 	slog.Info("扫描器协调器创建成功")
 
-	taskManager := task.NewManager(orchestrator, config.C)
+	runStore, err := runstate.NewStore(config.C.Logger.Path)
+	if err != nil {
+		_ = db.Close(context.Background())
+		slog.Error("FATAL: 无法初始化运行状态存储", "error", err)
+		os.Exit(1)
+	}
+	taskManager := task.NewManagerWithRunStore(orchestrator, config.C, runStore)
+	if err := taskManager.RecoverUnfinishedRuns(appCtx); err != nil {
+		_ = db.Close(context.Background())
+		slog.Error("FATAL: 无法恢复运行状态", "error", err)
+		os.Exit(1)
+	}
 	slog.Info("任务管理器创建成功")
 
-	router := api.RegisterRoutes(taskManager, db)
+	router := api.RegisterRoutesWithRunStore(taskManager, db, runStore)
 
 	server := &http.Server{
 		Addr:         config.C.Server.Port,

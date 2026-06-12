@@ -10,7 +10,12 @@ import (
 // Store 是一个顶层接口，它组合了所有特定数据模型的存储接口。
 type Store interface {
 	Series() SeriesStore
+	// Images returns an aggregate media read view. The method name is retained
+	// for API compatibility; media writes may target per-type collections.
 	Images() ImageStore
+	// Media returns a per-media-type store. Use it when reads or writes must not
+	// mix image/video/audio/text records.
+	Media(mediaType string) ImageStore
 	EnsureIndexes(ctx context.Context) error
 	Diagnostics(ctx context.Context) (Diagnostics, error)
 	DropAllCollections(ctx context.Context) error

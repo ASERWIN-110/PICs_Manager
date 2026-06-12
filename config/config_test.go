@@ -126,6 +126,18 @@ func TestValidateConfigRejectsInvalidLoggerFormat(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsInvalidMaintenanceWindow(t *testing.T) {
+	err := ValidateConfig(Config{
+		Scanner: ScannerConfig{
+			MaintenanceWindow: "bad",
+			FilePatterns:      []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "maintenanceWindow") {
+		t.Fatalf("expected maintenanceWindow error, got %v", err)
+	}
+}
+
 func TestWithMongoCredentialsAddsAuthSource(t *testing.T) {
 	got := withMongoCredentials("mongodb://localhost:27017", "dev_user", "secret", "admin")
 

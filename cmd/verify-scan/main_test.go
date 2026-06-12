@@ -94,6 +94,7 @@ type verifyFakeStore struct {
 
 func (s verifyFakeStore) Series() database.SeriesStore             { return verifyPanicSeriesStore{} }
 func (s verifyFakeStore) Images() database.ImageStore              { return verifyPanicImageStore{} }
+func (s verifyFakeStore) Media(string) database.ImageStore         { return verifyPanicImageStore{} }
 func (s verifyFakeStore) EnsureIndexes(context.Context) error      { return nil }
 func (s verifyFakeStore) DropAllCollections(context.Context) error { return nil }
 func (s verifyFakeStore) Close(context.Context) error              { return nil }

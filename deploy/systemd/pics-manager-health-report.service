@@ -1,0 +1,14 @@
+[Unit]
+Description=PICs Manager daily directory health report
+
+[Service]
+Type=oneshot
+User=pics-manager
+Group=pics-manager
+WorkingDirectory=/opt/pics-manager
+Environment=PIC_MANAGER_ENV_FILE=/etc/pics-manager/pics-manager.env
+ExecStart=/opt/pics-manager/pics-cli -action health-report
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/pics-manager /var/log/pics-manager /srv/media

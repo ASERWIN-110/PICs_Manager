@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -28,10 +29,13 @@ import (
 
 // Store 是 database.Store 接口的MongoDB实现。
 type Store struct {
-	client *mongo.Client
-	db     *mongo.Database
-	series *seriesStore
-	images *imageStore
+	mu           sync.RWMutex
+	client       *mongo.Client
+	db           *mongo.Database
+	series       *seriesStore
+	media        *mediaStore
+	mediaByType  map[string]*imageStore
+	mediaTypeSeq []string
 }
 
 var _ database.Store = (*Store)(nil)
@@ -41,9 +45,18 @@ type seriesStore struct {
 	coll *mongo.Collection
 }
 
-// imageStore 封装媒体文档集合。集合名保留 images 以兼容现有数据。
+// imageStore 封装单一媒体类型的物理集合。
 type imageStore struct {
-	coll *mongo.Collection
+	mediaType string
+	coll      *mongo.Collection
+}
+
+// mediaStore is an aggregate read view over all configured media collections.
+// Writes must go through Store.Media(mediaType) so non-image media never lands
+// in the legacy images collection.
+type mediaStore struct {
+	stores []*imageStore
+	images *imageStore
 }
 
 const pHashMaxHammingDistance = 10
@@ -118,15 +131,86 @@ func NewStore(ctx context.Context, cfg *config.Config) (database.Store, error) {
 
 	db := client.Database(cfg.Database.Name)
 	ss := &seriesStore{coll: db.Collection("series")}
-	is := &imageStore{coll: db.Collection("images")}
+	mediaByType, mediaSeq := buildMediaCollections(db, cfg)
+	mediaStores := make([]*imageStore, 0, len(mediaSeq))
+	for _, mediaType := range mediaSeq {
+		mediaStores = append(mediaStores, mediaByType[mediaType])
+	}
 
 	store := &Store{
-		client: client,
-		db:     db,
-		series: ss,
-		images: is,
+		client:       client,
+		db:           db,
+		series:       ss,
+		media:        &mediaStore{stores: mediaStores, images: mediaByType["image"]},
+		mediaByType:  mediaByType,
+		mediaTypeSeq: mediaSeq,
 	}
 	return store, nil
+}
+
+func buildMediaCollections(db *mongo.Database, cfg *config.Config) (map[string]*imageStore, []string) {
+	types := []string{"image"}
+	if cfg != nil {
+		for _, mediaType := range cfg.Scanner.MediaTypes {
+			types = append(types, mediaType.Type)
+		}
+	}
+	types = append(types, "video", "audio", "text")
+
+	stores := make(map[string]*imageStore)
+	seq := make([]string, 0, len(types))
+	for _, typ := range types {
+		mediaType := normalizedMediaType(typ)
+		if mediaType == "" {
+			continue
+		}
+		if _, exists := stores[mediaType]; exists {
+			continue
+		}
+		stores[mediaType] = &imageStore{
+			mediaType: mediaType,
+			coll:      db.Collection(mediaCollectionName(mediaType)),
+		}
+		seq = append(seq, mediaType)
+	}
+	sort.Strings(seq)
+	return stores, seq
+}
+
+func orderedMediaStores(stores map[string]*imageStore, seq []string) []*imageStore {
+	ordered := make([]*imageStore, 0, len(seq))
+	for _, mediaType := range seq {
+		if store := stores[mediaType]; store != nil {
+			ordered = append(ordered, store)
+		}
+	}
+	return ordered
+}
+
+func normalizedMediaType(mediaType string) string {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType == "" {
+		return ""
+	}
+	re := regexp.MustCompile(`[^a-z0-9_]+`)
+	mediaType = re.ReplaceAllString(mediaType, "_")
+	mediaType = strings.Trim(mediaType, "_")
+	return mediaType
+}
+
+func mediaCollectionName(mediaType string) string {
+	switch normalizedMediaType(mediaType) {
+	case "image":
+		return "images"
+	case "video":
+		return "videos"
+	case "audio":
+		return "audios"
+	case "text":
+		return "texts"
+	default:
+		return "media_" + normalizedMediaType(mediaType)
+	}
 }
 
 func redactMongoURI(raw string) string {
@@ -148,7 +232,43 @@ func (s *Store) Series() database.SeriesStore {
 }
 
 func (s *Store) Images() database.ImageStore {
-	return s.images
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.media
+}
+
+func (s *Store) Media(mediaType string) database.ImageStore {
+	mediaType = normalizedMediaType(mediaType)
+	if mediaType == "" {
+		mediaType = "unknown"
+	}
+	s.mu.RLock()
+	if store, ok := s.mediaByType[mediaType]; ok {
+		s.mu.RUnlock()
+		return store
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if store, ok := s.mediaByType[mediaType]; ok {
+		return store
+	}
+	store := &imageStore{
+		mediaType: mediaType,
+		coll:      s.db.Collection(mediaCollectionName(mediaType)),
+	}
+	s.mediaByType[mediaType] = store
+	s.mediaTypeSeq = append(s.mediaTypeSeq, mediaType)
+	sort.Strings(s.mediaTypeSeq)
+	s.media = &mediaStore{stores: orderedMediaStores(s.mediaByType, s.mediaTypeSeq), images: s.mediaByType["image"]}
+
+	indexCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := ensureMediaCollectionIndexes(indexCtx, store); err != nil {
+		slog.Error("为运行期新增媒体集合创建索引失败", "mediaType", mediaType, "collection", store.coll.Name(), "error", err)
+	}
+	return store
 }
 
 func (s *Store) Close(ctx context.Context) error {
@@ -177,26 +297,34 @@ func (s *Store) Diagnostics(ctx context.Context) (database.Diagnostics, error) {
 	}); err != nil {
 		return diagnostics, err
 	}
-	if diagnostics.MediaCount, err = s.images.coll.CountDocuments(ctx, bson.D{}); err != nil {
+	for _, store := range s.mediaStores() {
+		count, err := store.coll.CountDocuments(ctx, bson.D{})
+		if err != nil {
+			return diagnostics, err
+		}
+		diagnostics.MediaCount += count
+	}
+	imageStore := s.imageStore()
+	if imageStore == nil {
+		return diagnostics, fmt.Errorf("image media collection is not configured")
+	}
+	if diagnostics.ImageMediaCount, err = imageStore.coll.CountDocuments(ctx, bson.M{"mediaType": "image"}); err != nil {
 		return diagnostics, err
 	}
-	if diagnostics.ImageMediaCount, err = s.images.coll.CountDocuments(ctx, bson.M{"mediaType": "image"}); err != nil {
-		return diagnostics, err
-	}
-	if diagnostics.ImagesWithPHash, err = s.images.coll.CountDocuments(ctx, bson.M{
+	if diagnostics.ImagesWithPHash, err = imageStore.coll.CountDocuments(ctx, bson.M{
 		"mediaType":      "image",
 		"perceptualHash": bson.M{"$ne": ""},
 	}); err != nil {
 		return diagnostics, err
 	}
-	if diagnostics.ImagesWithPHashBuckets, err = s.images.coll.CountDocuments(ctx, bson.M{
+	if diagnostics.ImagesWithPHashBuckets, err = imageStore.coll.CountDocuments(ctx, bson.M{
 		"mediaType":      "image",
 		"perceptualHash": bson.M{"$ne": ""},
 		"pHashBuckets.0": bson.M{"$exists": true},
 	}); err != nil {
 		return diagnostics, err
 	}
-	if diagnostics.ImagesMissingPHashBuckets, err = s.images.coll.CountDocuments(ctx, bson.M{
+	if diagnostics.ImagesMissingPHashBuckets, err = imageStore.coll.CountDocuments(ctx, bson.M{
 		"mediaType":      "image",
 		"perceptualHash": bson.M{"$ne": ""},
 		"pHashBuckets.0": bson.M{"$exists": false},
@@ -206,10 +334,22 @@ func (s *Store) Diagnostics(ctx context.Context) (database.Diagnostics, error) {
 	if diagnostics.SeriesIndexes, err = indexNames(ctx, s.series.coll); err != nil {
 		return diagnostics, err
 	}
-	if diagnostics.ImageIndexes, err = indexNames(ctx, s.images.coll); err != nil {
+	if diagnostics.ImageIndexes, err = indexNames(ctx, imageStore.coll); err != nil {
 		return diagnostics, err
 	}
 	return diagnostics, nil
+}
+
+func (s *Store) mediaStores() []*imageStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return orderedMediaStores(s.mediaByType, s.mediaTypeSeq)
+}
+
+func (s *Store) imageStore() *imageStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mediaByType["image"]
 }
 
 func indexNames(ctx context.Context, coll *mongo.Collection) ([]string, error) {
@@ -234,53 +374,13 @@ func indexNames(ctx context.Context, coll *mongo.Collection) ([]string, error) {
 
 func (s *Store) EnsureIndexes(ctx context.Context) error {
 	slog.Info("正在确保数据库索引存在...")
-	imageIndexes := []mongo.IndexModel{
-		{
-			Keys:    bson.D{{Key: "filePath", Value: 1}},
-			Options: options.Index().SetUnique(true).SetName("idx_filepath_unique"),
-		},
-
-		{
-			Keys:    bson.D{{Key: "fileHash", Value: 1}},
-			Options: options.Index().SetName("idx_filehash"),
-		},
-
-		{
-			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "_id", Value: 1}},
-			Options: options.Index().SetName("idx_seriesid_id"),
-		},
-		{
-			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "fileName", Value: 1}, {Key: "_id", Value: 1}},
-			Options: options.Index().SetName("idx_seriesid_filename_id"),
-		},
-
-		{
-			Keys:    bson.D{{Key: "perceptualHash", Value: 1}},
-			Options: options.Index().SetName("idx_phash"),
-		},
-		{
-			Keys:    bson.D{{Key: "mediaType", Value: 1}, {Key: "pHashBuckets", Value: 1}},
-			Options: options.Index().SetName("idx_phash_buckets_mediatype"),
-		},
-		{
-			Keys:    bson.D{{Key: "mediaType", Value: 1}},
-			Options: options.Index().SetName("idx_mediatype"),
-		},
-		{
-			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "thumbnail", Value: 1}, {Key: "fileName", Value: 1}},
-			Options: options.Index().SetName("idx_seriesid_thumbnail_filename"),
-		},
-
-		{
-			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "fileName", Value: 1}},
-			Options: options.Index().SetUnique(true).SetName("idx_seriesid_filename_unique"),
-		},
+	for _, store := range s.mediaStores() {
+		if err := ensureMediaCollectionIndexes(ctx, store); err != nil {
+			slog.Error("为媒体集合创建索引失败", "collection", store.coll.Name(), "error", err)
+			return err
+		}
+		slog.Info("媒体集合索引已验证/创建。", "collection", store.coll.Name())
 	}
-	if _, err := s.images.coll.Indexes().CreateMany(ctx, imageIndexes); err != nil {
-		slog.Error("为 images 集合创建索引失败", "error", err)
-		return err
-	}
-	slog.Info("Images 集合索引已验证/创建。")
 
 	seriesIndexes := []mongo.IndexModel{
 		{
@@ -308,13 +408,56 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 	if err := s.backfillSeriesThumbnailFlags(ctx); err != nil {
 		return err
 	}
-	if err := s.backfillImageThumbnailFlags(ctx); err != nil {
+	if err := s.backfillMediaThumbnailFlags(ctx); err != nil {
 		return err
 	}
 	if err := s.backfillPHashBuckets(ctx); err != nil {
 		return err
 	}
 	return nil
+}
+
+func ensureMediaCollectionIndexes(ctx context.Context, store *imageStore) error {
+	imageIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "filePath", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("idx_filepath_unique"),
+		},
+		{
+			Keys:    bson.D{{Key: "fileHash", Value: 1}},
+			Options: options.Index().SetName("idx_filehash"),
+		},
+		{
+			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName("idx_seriesid_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "fileName", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName("idx_seriesid_filename_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "perceptualHash", Value: 1}},
+			Options: options.Index().SetName("idx_phash"),
+		},
+		{
+			Keys:    bson.D{{Key: "mediaType", Value: 1}, {Key: "pHashBuckets", Value: 1}},
+			Options: options.Index().SetName("idx_phash_buckets_mediatype"),
+		},
+		{
+			Keys:    bson.D{{Key: "mediaType", Value: 1}},
+			Options: options.Index().SetName("idx_mediatype"),
+		},
+		{
+			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "thumbnail", Value: 1}, {Key: "fileName", Value: 1}},
+			Options: options.Index().SetName("idx_seriesid_thumbnail_filename"),
+		},
+		{
+			Keys:    bson.D{{Key: "seriesId", Value: 1}, {Key: "fileName", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("idx_seriesid_filename_unique"),
+		},
+	}
+	_, err := store.coll.Indexes().CreateMany(ctx, imageIndexes)
+	return err
 }
 
 func (s *Store) backfillSeriesThumbnailFlags(ctx context.Context) error {
@@ -339,24 +482,26 @@ func (s *Store) backfillSeriesThumbnailFlags(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) backfillImageThumbnailFlags(ctx context.Context) error {
-	withThumbnail, err := s.images.coll.UpdateMany(ctx, bson.M{
-		"thumbnail": bson.M{"$exists": true, "$ne": ""},
-	}, bson.M{"$set": bson.M{"hasThumbnail": true}})
-	if err != nil {
-		return fmt.Errorf("回填媒体缩略图标记失败: %w", err)
-	}
-	withoutThumbnail, err := s.images.coll.UpdateMany(ctx, bson.M{
-		"$or": bson.A{
-			bson.M{"thumbnail": bson.M{"$exists": false}},
-			bson.M{"thumbnail": ""},
-		},
-	}, bson.M{"$set": bson.M{"hasThumbnail": false}})
-	if err != nil {
-		return fmt.Errorf("回填媒体缩略图标记失败: %w", err)
-	}
-	if withThumbnail.ModifiedCount+withoutThumbnail.ModifiedCount > 0 {
-		slog.Info("已补齐媒体缩略图标记", "withThumbnail", withThumbnail.ModifiedCount, "withoutThumbnail", withoutThumbnail.ModifiedCount)
+func (s *Store) backfillMediaThumbnailFlags(ctx context.Context) error {
+	for _, store := range s.mediaStores() {
+		withThumbnail, err := store.coll.UpdateMany(ctx, bson.M{
+			"thumbnail": bson.M{"$exists": true, "$ne": ""},
+		}, bson.M{"$set": bson.M{"hasThumbnail": true}})
+		if err != nil {
+			return fmt.Errorf("回填媒体缩略图标记失败 %s: %w", store.coll.Name(), err)
+		}
+		withoutThumbnail, err := store.coll.UpdateMany(ctx, bson.M{
+			"$or": bson.A{
+				bson.M{"thumbnail": bson.M{"$exists": false}},
+				bson.M{"thumbnail": ""},
+			},
+		}, bson.M{"$set": bson.M{"hasThumbnail": false}})
+		if err != nil {
+			return fmt.Errorf("回填媒体缩略图标记失败 %s: %w", store.coll.Name(), err)
+		}
+		if withThumbnail.ModifiedCount+withoutThumbnail.ModifiedCount > 0 {
+			slog.Info("已补齐媒体缩略图标记", "collection", store.coll.Name(), "withThumbnail", withThumbnail.ModifiedCount, "withoutThumbnail", withoutThumbnail.ModifiedCount)
+		}
 	}
 	return nil
 }
@@ -370,7 +515,11 @@ func (s *Store) backfillPHashBuckets(ctx context.Context) error {
 	opts := options.Find().
 		SetProjection(bson.M{"perceptualHash": 1}).
 		SetBatchSize(500)
-	cursor, err := s.images.coll.Find(ctx, filter, opts)
+	imageStore := s.imageStore()
+	if imageStore == nil {
+		return fmt.Errorf("image media collection is not configured")
+	}
+	cursor, err := imageStore.coll.Find(ctx, filter, opts)
 	if err != nil {
 		return fmt.Errorf("查询待补齐 pHash bucket 的图片失败: %w", err)
 	}
@@ -382,7 +531,7 @@ func (s *Store) backfillPHashBuckets(ctx context.Context) error {
 		if len(writes) == 0 {
 			return nil
 		}
-		if _, err := s.images.coll.BulkWrite(ctx, writes, options.BulkWrite().SetOrdered(false)); err != nil {
+		if _, err := imageStore.coll.BulkWrite(ctx, writes, options.BulkWrite().SetOrdered(false)); err != nil {
 			return err
 		}
 		updated += len(writes)
@@ -487,6 +636,19 @@ func (i *imageStore) GetByID(ctx context.Context, id primitive.ObjectID) (*model
 	return &image, nil
 }
 
+func (m *mediaStore) GetByID(ctx context.Context, id primitive.ObjectID) (*models.Image, error) {
+	for _, store := range m.stores {
+		item, err := store.GetByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if item != nil {
+			return item, nil
+		}
+	}
+	return nil, nil
+}
+
 func (i *imageStore) ListBySeriesIDCursor(ctx context.Context, seriesID primitive.ObjectID, cursor string, limit int) ([]models.Image, int64, string, error) {
 	decoded, err := decodePageCursor(cursor)
 	if err != nil {
@@ -528,6 +690,35 @@ func (i *imageStore) ListBySeriesIDCursor(ctx context.Context, seriesID primitiv
 	return imageList, total, nextCursor, nil
 }
 
+func (m *mediaStore) ListBySeriesIDCursor(ctx context.Context, seriesID primitive.ObjectID, cursor string, limit int) ([]models.Image, int64, string, error) {
+	if limit <= 0 {
+		return []models.Image{}, 0, "", nil
+	}
+	var merged []models.Image
+	var total int64
+	for _, store := range m.stores {
+		items, count, _, err := store.ListBySeriesIDCursor(ctx, seriesID, cursor, limit)
+		if err != nil {
+			return nil, 0, "", err
+		}
+		merged = append(merged, items...)
+		total += count
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].FileName != merged[j].FileName {
+			return merged[i].FileName < merged[j].FileName
+		}
+		return merged[i].ID.Hex() < merged[j].ID.Hex()
+	})
+	merged, nextCursor, err := trimCursorPage(merged, limit, func(last models.Image) (string, error) {
+		return encodePageCursor(pageCursor{FileName: last.FileName, ID: last.ID.Hex()})
+	})
+	if err != nil {
+		return nil, 0, "", err
+	}
+	return merged, total, nextCursor, nil
+}
+
 func (i *imageStore) FindSimilarByPHash(ctx context.Context, pHash string, limit int) ([]models.Image, error) {
 	if limit <= 0 {
 		return []models.Image{}, nil
@@ -563,6 +754,13 @@ func (i *imageStore) FindSimilarByPHash(ctx context.Context, pHash string, limit
 	defer cursor.Close(ctx)
 
 	return nearestImagesByPHashCursor(ctx, cursor, target, limit)
+}
+
+func (m *mediaStore) FindSimilarByPHash(ctx context.Context, pHash string, limit int) ([]models.Image, error) {
+	if m.images == nil {
+		return []models.Image{}, nil
+	}
+	return m.images.FindSimilarByPHash(ctx, pHash, limit)
 }
 
 type pHashCandidate struct {
@@ -687,9 +885,30 @@ func (i *imageStore) Delete(ctx context.Context, id primitive.ObjectID) error {
 	return err
 }
 
+func (m *mediaStore) Delete(ctx context.Context, id primitive.ObjectID) error {
+	for _, store := range m.stores {
+		if err := store.Delete(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (i *imageStore) CountBySeriesID(ctx context.Context, seriesID primitive.ObjectID) (int64, error) {
 	filter := bson.M{"seriesId": seriesID}
 	return i.coll.CountDocuments(ctx, filter)
+}
+
+func (m *mediaStore) CountBySeriesID(ctx context.Context, seriesID primitive.ObjectID) (int64, error) {
+	var total int64
+	for _, store := range m.stores {
+		count, err := store.CountBySeriesID(ctx, seriesID)
+		if err != nil {
+			return 0, err
+		}
+		total += count
+	}
+	return total, nil
 }
 
 func (s *seriesStore) SearchByNameCursor(ctx context.Context, nameQuery string, cursor string, limit int) ([]models.Series, int64, string, error) {
@@ -749,6 +968,13 @@ func (i *imageStore) BulkWrite(ctx context.Context, models []mongo.WriteModel) e
 		return err
 	}
 	return nil
+}
+
+func (m *mediaStore) BulkWrite(ctx context.Context, models []mongo.WriteModel) error {
+	if len(models) == 0 {
+		return nil
+	}
+	return fmt.Errorf("aggregate media store cannot bulk write; use media-specific collection")
 }
 
 func (s *seriesStore) BulkWrite(ctx context.Context, models []mongo.WriteModel) error {
@@ -815,6 +1041,13 @@ func (i *imageStore) GetFirstThumbnailMedia(ctx context.Context, seriesID primit
 	return &image, nil
 }
 
+func (m *mediaStore) GetFirstThumbnailMedia(ctx context.Context, seriesID primitive.ObjectID) (*models.Image, error) {
+	if m.images == nil {
+		return nil, nil
+	}
+	return m.images.GetFirstThumbnailMedia(ctx, seriesID)
+}
+
 // DropAllCollections 删除当前数据库中的所有已知集合，主要用于测试环境的重置。
 func (s *Store) DropAllCollections(ctx context.Context) error {
 	slog.Warn("正在删除所有集合...", "database", s.db.Name())
@@ -822,9 +1055,11 @@ func (s *Store) DropAllCollections(ctx context.Context) error {
 		slog.Error("删除 series 集合失败", "error", err)
 		// 即使出错也继续尝试删除其他集合
 	}
-	if err := s.images.coll.Drop(ctx); err != nil {
-		slog.Error("删除 images 集合失败", "error", err)
-		return err
+	for _, store := range s.mediaStores() {
+		if err := store.coll.Drop(ctx); err != nil {
+			slog.Error("删除媒体集合失败", "collection", store.coll.Name(), "error", err)
+			return err
+		}
 	}
 	slog.Info("所有集合已成功删除。")
 	return nil
@@ -870,4 +1105,22 @@ func (i *imageStore) GetAllBySeriesID(ctx context.Context, seriesID primitive.Ob
 	}
 
 	return images, nil
+}
+
+func (m *mediaStore) GetAllBySeriesID(ctx context.Context, seriesID primitive.ObjectID) ([]models.Image, error) {
+	var merged []models.Image
+	for _, store := range m.stores {
+		items, err := store.GetAllBySeriesID(ctx, seriesID)
+		if err != nil {
+			return nil, err
+		}
+		merged = append(merged, items...)
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].FileName != merged[j].FileName {
+			return merged[i].FileName < merged[j].FileName
+		}
+		return merged[i].ID.Hex() < merged[j].ID.Hex()
+	})
+	return merged, nil
 }

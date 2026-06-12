@@ -37,6 +37,7 @@ MONGO_APP_AUTH_SOURCE=admin
 server:
   port: ":8080"
   timeout: 30s
+  maintenanceToken: ""
 
 database:
   uri: "mongodb://localhost:27017"
@@ -51,6 +52,9 @@ scanner:
   quarantinePath: "/path/to/quarantine"
   workerCount: 0
   batchSize: 100
+  ioThrottleMs: 0
+  maintenanceWindow: ""
+  maxFilesPerDir: 5000
 ```
 
 `scanner.mode` 可选值：
@@ -65,6 +69,15 @@ scanner:
 - `finalLibraryPath`：最终媒体库目录。
 - `backupPath`：清单和数据库备份输出目录。
 - `quarantinePath`：损坏文件或无法安全合并的目录。
+
+NAS 长期运行相关字段：
+
+- `workerCount`：`0` 表示使用保守默认值，最多 4 个 worker。历史导入时可以手动调高，但不建议默认用满 CPU。
+- `ioThrottleMs`：每次分类移动文件前等待的毫秒数。机械盘或低端 NAS 可以设置为 `5`、`10` 这类小值降低 IO 峰值。
+- `maintenanceWindow`：维护时间窗口，格式 `HH:MM-HH:MM`，例如 `01:00-06:00`。留空表示任何时间都允许运行。
+- `maxFilesPerDir`：目录健康报告阈值。单目录文件数超过该值会写入报告 warnings。
+
+`server.maintenanceToken` 为空时保持本地兼容；设置后，维护接口需要 `Authorization: Bearer <token>` 或 `X-Maintenance-Token: <token>`。只读查看接口不需要 token。
 
 ## 媒体类型和分类规则
 
@@ -86,6 +99,8 @@ scanner:
 `image` 会兼容历史 `scanner.filePatterns`。不要为了“美化”文件名改动已有图片正则，分类稳定性依赖这些公式。
 
 不在 `mediaTypes.extensions` 中的文件会被跳过，不会入库，也不会出现在最终媒体库中。
+
+最终库物理目录和 MongoDB 物理集合都会按媒体类型拆分：图片使用 `images`，视频使用 `videos`，音频使用 `audios`，文本使用 `texts`，自定义类型使用 `media_<type>`。例如视频文件会落到 `<finalLibraryPath>/videos/V/Video/Video_1.mp4`，并写入 MongoDB 的 `videos` 集合。查看 API 和前端也按媒体类型分页查询，不会把图片、视频、音频、文本混在同一个列表里。
 
 ## 同名文件处理
 
@@ -139,11 +154,29 @@ go run ./cmd/cli -action scan -mode classifyOnly \
 # 生成文件清单
 go run ./cmd/cli -action create-manifest
 
+# 只生成目录健康报告，不触发整理
+go run ./cmd/cli -action health-report
+
 # 备份数据库
 go run ./cmd/cli -action dump-database
 
+# 从最终库补齐或重建数据库记录
+go run ./cmd/cli -action rebuild-database
+
 # 查看统计和索引状态
 go run ./cmd/cli -action stats
+
+# 查看最近运行记录
+go run ./cmd/cli -action list-runs -limit 20
+
+# 查看单次运行摘要
+go run ./cmd/cli -action show-run -run-id '<runId>'
+
+# 查看单次运行 journal
+go run ./cmd/cli -action run-journal -run-id '<runId>'
+
+# 校验某次中断/停止/暂停运行是否具备恢复依据
+go run ./cmd/cli -action verify-run -run-id '<runId>'
 ```
 
 查询命令：
@@ -158,8 +191,9 @@ go run ./cmd/cli -action list-series -limit 50 -cursor '<nextCursor>'
 # 搜索系列
 go run ./cmd/cli -action search -query keyword -limit 50
 
-# 列出某个系列下的媒体
-go run ./cmd/cli -action list-media -series-id '<seriesObjectId>' -limit 50
+# 按媒体类型列出某个系列下的媒体
+go run ./cmd/cli -action list-media -series-id '<seriesObjectId>' -media-type image -limit 50
+go run ./cmd/cli -action list-media -series-id '<seriesObjectId>' -media-type video -limit 50
 ```
 
 分页优先使用 `cursor`。`page > 1` 会通过游标逐页走到目标页，只适合人工排查；大量数据下不要依赖深分页。
@@ -191,8 +225,14 @@ http://localhost:8080/api/v1
 ```text
 POST /api/v1/tasks
 GET  /api/v1/tasks/{taskId}
+DELETE /api/v1/tasks/{taskId}
+POST /api/v1/tasks/{taskId}/pause
+GET  /api/v1/runs
+GET  /api/v1/runs/{runId}
+GET  /api/v1/runs/{runId}/journal
 GET  /api/v1/series?limit=20&cursor=
-GET  /api/v1/series/{seriesId}/images?limit=20&cursor=
+GET  /api/v1/series/{seriesId}/media/{mediaType}?limit=20&cursor=
+GET  /api/v1/series/{seriesId}/images?limit=20&cursor=      # 兼容接口，只返回图片
 GET  /api/v1/series/{seriesId}/thumbnail
 GET  /api/v1/images/{imageId}/thumbnail
 GET  /api/v1/search/text?q=keyword&limit=20&cursor=
@@ -228,6 +268,66 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 
 缩略图不会内联在 JSON 中。列表只返回 `thumbnailUrl`，前端按需请求缩略图 URL。
 
+## 运行记录和 journal
+
+每次扫描会在日志目录下写入持久运行记录：
+
+```text
+<logger.path>/runs/<runId>.json
+<logger.path>/runs/<runId>.journal.jsonl
+```
+
+run JSON 包含：
+
+- `status`：`pending`、`running`、`stopping`、`stopped`、`pausing`、`paused`、`completed`、`failed`、`interrupted`。
+- `phase`：当前或最后阶段，例如 `preprocess`、`classify_done`、`archive_done`、`database_sync_done`。
+- `counts`：阶段计数，例如 `preprocessedFiles`、`unsupportedFiles`、`classifiedFiles`、`sameNameFiles`。
+- `errorSummary`：失败或启动恢复摘要。
+
+journal 是 JSONL，每行一个事件。预处理、分类、聚合归档和入库阶段都会记录关键 before/after 事件，阶段结束会记录 checkpoint。后端启动时会把上次未结束的 `pending/running` run 标记为 `interrupted`，避免无人值守时误以为任务仍在运行。
+
+同一时刻只允许一个维护任务。CLI 和 server 共用 `<logger.path>/runs/active.lock`，因此不会同时整理同一批文件。
+
+停止后台任务：
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/tasks/<taskId> \
+  -H 'X-Maintenance-Token: <token>'
+```
+
+停止会取消当前扫描 context，并把 run 标记为 `stopped`。下一次可以通过最终库、健康报告和 journal 判断恢复点；数据库侧可以用 `rebuild-database` 从最终库补齐。
+
+暂停后台任务：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/tasks/<taskId>/pause \
+  -H 'X-Maintenance-Token: <token>'
+```
+
+暂停同样会取消当前扫描 context，但 run 会标记为 `paused`。它表达的是人为暂停，可用于 NAS 维护窗口结束、需要释放 IO 或准备后续恢复检查的场景。
+
+恢复校验：
+
+```bash
+go run ./cmd/cli -action verify-run -run-id '<runId>'
+```
+
+该命令会读取 run+journal，确认存在 checkpoint，并基于当前最终库生成一份 `verify-<runId>.health.json`。它不会自动移动文件；它用于判断是否可以通过重新扫描或 `rebuild-database` 继续恢复。
+
+`verify-run` 会输出 `recoveryStatus`：
+
+- `complete`：运行已完成，当前校验未发现需要关注的错误。
+- `recoverable_with_review`：运行被中断、停止、暂停或失败，但存在 checkpoint，可结合最终库和 journal 继续检查。
+- `needs_attention`：journal 中存在失败事件或健康报告 warnings，恢复前需要人工查看。
+
+每次归档后会输出目录健康报告：
+
+```text
+<backupPath>/reports/<runId>.health.json
+```
+
+报告包含最终库目录数、文件数、`.same-name` 文件数、隔离区文件数、非媒体跳过数、单目录最大文件数和阈值 warnings。`health-report` 的非媒体计数基于当前 `scanPath` 和媒体扩展配置做只读统计，不移动文件。
+
 ## 验证扫描结果
 
 `verify-scan` 会复制或硬链接源数据到工作目录，运行扫描，然后比较输入、输出、隔离区和数据库数量。
@@ -262,8 +362,8 @@ go run ./cmd/verify-scan \
 下载对应平台包后解压：
 
 ```bash
-tar -xzf PICs_Manager_v0.1.0_linux_amd64.tar.gz
-cd PICs_Manager_v0.1.0_linux_amd64
+tar -xzf PICs_Manager_v0.1.1_linux_amd64.tar.gz
+cd PICs_Manager_v0.1.1_linux_amd64
 ```
 
 修改 `config.yaml`，然后运行：
@@ -275,3 +375,16 @@ cd PICs_Manager_v0.1.0_linux_amd64
 ```
 
 Windows 包中可执行文件后缀为 `.exe`。
+
+## NAS 部署
+
+部署模板在 `deploy/`：
+
+- `deploy/systemd/pics-manager.service`
+- `deploy/systemd/pics-manager-health-report.service`
+- `deploy/systemd/pics-manager-health-report.timer`
+- `deploy/logrotate/pics-manager`
+- `deploy/docker-compose.yml`
+- `Dockerfile`
+
+systemd 模板默认把服务限制在指定媒体目录和运行目录内写入。Docker Compose 示例默认把后端和 MongoDB 绑定到 `127.0.0.1`，并通过 `/health` 做容器健康检查；前端查看端可以单独部署。

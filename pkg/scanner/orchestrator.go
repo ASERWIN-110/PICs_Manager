@@ -3,6 +3,7 @@ package scanner
 import (
 	"PICs_Manager/config"
 	"PICs_Manager/pkg/database"
+	"PICs_Manager/pkg/runstate"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Orchestrator struct {
@@ -48,6 +50,7 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	recorder, hasRecorder := runstate.FromContext(ctx)
 	mode := strings.TrimSpace(cfg.Mode)
 	if mode == "" {
 		mode = "full"
@@ -57,6 +60,9 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 	}
 	if mode == "full" && o.db == nil {
 		return errors.New("full 模式需要数据库存储")
+	}
+	if err := ensureMaintenanceWindow(cfg.MaintenanceWindow, timeNow); err != nil {
+		return err
 	}
 
 	absScanPath, err := filepath.Abs(cfg.ScanPath)
@@ -87,28 +93,34 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 		}
 	}
 
-	preprocessor, err := NewPreprocessor(o.logDir, cfg.WorkerCount)
+	preprocessor, err := NewPreprocessor(o.logDir, cfg.WorkerCount, recorder)
 	if err != nil {
 		return fmt.Errorf("创建预处理器失败: %w", err)
 	}
 	defer preprocessor.Close()
 
-	classifier, err := NewClassifier(o.logDir, absStagingPath, cfg)
+	classifier, err := NewClassifierWithRecorder(o.logDir, absStagingPath, cfg, recorder)
 	if err != nil {
 		return fmt.Errorf("创建分类器失败: %w", err)
 	}
 	defer classifier.Close()
 
-	aggregator, err := NewAggregator(o.logDir, cfg.SeriesGroupRules, cfg.WorkerCount)
+	aggregator, err := NewAggregatorWithMediaRoots(o.logDir, cfg.SeriesGroupRules, cfg.WorkerCount, mediaStorageRoots(cfg), recorder)
 	if err != nil {
 		return fmt.Errorf("创建聚合器失败: %w", err)
 	}
 	defer aggregator.Close()
 
 	log.Printf("--- 阶段 1/4: 预处理 ---")
+	if hasRecorder {
+		recorder.Phase(ctx, "preprocess", nil)
+	}
 	healthyFiles, err := preprocessor.ProcessDirectory(absScanPath)
 	if err != nil {
 		return fmt.Errorf("预处理阶段失败: %w", err)
+	}
+	if hasRecorder {
+		recorder.Phase(ctx, "preprocess_done", map[string]int64{"preprocessedFiles": int64(len(healthyFiles))})
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -117,8 +129,15 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 	if err != nil {
 		return fmt.Errorf("媒体类型配置无效: %w", err)
 	}
+	unsupportedCount := len(healthyFiles) - len(mediaFiles)
 	if len(mediaFiles) != len(healthyFiles) {
-		log.Printf("跳过 %d 个未配置媒体类型的文件", len(healthyFiles)-len(mediaFiles))
+		log.Printf("跳过 %d 个未配置媒体类型的文件", unsupportedCount)
+		if hasRecorder {
+			recorder.Phase(ctx, "media_filter_done", map[string]int64{"unsupportedFiles": int64(unsupportedCount), "mediaFiles": int64(len(mediaFiles))})
+			for _, path := range unsupportedFiles(healthyFiles, mediaFiles) {
+				recorder.Event(ctx, runstate.Event{Phase: "media_filter", Action: "file_skipped_unsupported", Source: path, Status: "skipped"})
+			}
+		}
 	}
 	mediaFiles, corruptedCount, err := quarantineCorruptedImages(ctx, mediaFiles, absQuarantinePath, cfg.WorkerCount)
 	if err != nil {
@@ -127,7 +146,24 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 	if corruptedCount > 0 {
 		log.Printf("检测并隔离 %d 个损坏图片", corruptedCount)
 	}
+	if hasRecorder {
+		recorder.Phase(ctx, "quarantine_done", map[string]int64{"corruptedImages": int64(corruptedCount), "healthyMediaFiles": int64(len(mediaFiles))})
+	}
 	if len(mediaFiles) == 0 {
+		report, reportErr := WriteDirectoryHealthReport(ctx, absFinalLibraryPath, absQuarantinePath, absBackupPath, cfg.MaxFilesPerDir, recorder.RunID, unsupportedCount)
+		if reportErr != nil {
+			return fmt.Errorf("生成目录健康报告失败: %w", reportErr)
+		}
+		if hasRecorder {
+			recorder.Phase(ctx, "health_report_done", map[string]int64{
+				"directories":      int64(report.Directories),
+				"mediaFiles":       int64(report.Files),
+				"sameNameFiles":    int64(report.SameNameFiles),
+				"quarantineFiles":  int64(report.QuarantineFiles),
+				"unsupportedFiles": int64(report.UnsupportedFiles),
+				"warnings":         int64(len(report.Warnings)),
+			})
+		}
 		log.Println("没有找到可处理的新文件，任务结束。")
 		return nil
 	}
@@ -136,21 +172,48 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 	}
 
 	log.Printf("--- 阶段 2/4: 分类到中转站 ---")
+	if hasRecorder {
+		recorder.Phase(ctx, "classify", nil)
+	}
 	createdSeries, processedFileNames, err := classifier.ClassifyAndMove(mediaFiles)
 	if err != nil {
 		return fmt.Errorf("分类和移动阶段失败: %w", err)
 	}
 	log.Printf("--- 分类阶段完毕，处理了 %d 个文件，涉及 %d 个系列 ---", len(processedFileNames), len(createdSeries))
+	if hasRecorder {
+		recorder.Phase(ctx, "classify_done", map[string]int64{"classifiedFiles": int64(len(processedFileNames)), "seriesTouched": int64(len(createdSeries))})
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	log.Printf("--- 阶段 3/4: 聚合与归档 ---")
+	if hasRecorder {
+		recorder.Phase(ctx, "archive", nil)
+	}
 	changelog, err := aggregator.AggregateAndArchive(absStagingPath, absFinalLibraryPath, absQuarantinePath)
 	if err != nil {
 		return fmt.Errorf("聚合归档阶段失败: %w", err)
 	}
 	log.Printf("--- 归档阶段完毕，生成变更日志，共 %d 项变更 ---", len(changelog))
+	if hasRecorder {
+		recorder.Phase(ctx, "archive_done", map[string]int64{"pathChanges": int64(len(changelog))})
+	}
+
+	report, err := WriteDirectoryHealthReport(ctx, absFinalLibraryPath, absQuarantinePath, absBackupPath, cfg.MaxFilesPerDir, recorder.RunID, unsupportedCount)
+	if err != nil {
+		return fmt.Errorf("生成目录健康报告失败: %w", err)
+	}
+	if hasRecorder {
+		recorder.Phase(ctx, "health_report_done", map[string]int64{
+			"directories":      int64(report.Directories),
+			"mediaFiles":       int64(report.Files),
+			"sameNameFiles":    int64(report.SameNameFiles),
+			"quarantineFiles":  int64(report.QuarantineFiles),
+			"unsupportedFiles": int64(report.UnsupportedFiles),
+			"warnings":         int64(len(report.Warnings)),
+		})
+	}
 
 	if mode == "classifyOnly" {
 		log.Println("--- classifyOnly 模式：跳过数据库同步 ---")
@@ -158,6 +221,9 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 	}
 
 	log.Println("--- 阶段 4/4: 数据库同步 ---")
+	if hasRecorder {
+		recorder.Phase(ctx, "database_sync", nil)
+	}
 	ingestor, err := NewIngestor(o.logDir, o.db, cfg, cfg.WorkerCount, cfg.BatchSize)
 	if err != nil {
 		return fmt.Errorf("创建入库器失败: %w", err)
@@ -171,18 +237,21 @@ func (o *Orchestrator) RunFullScanContext(ctx context.Context, cfg config.Scanne
 		log.Printf("警告：在操作过程中，检测到 %d 个文件可能被覆盖，详情请查看 ingestor.log", len(overwritten))
 
 	}
+	if hasRecorder {
+		recorder.Phase(ctx, "database_sync_done", map[string]int64{"overwrittenFiles": int64(len(overwritten))})
+	}
 
 	log.Println("全库扫描任务完成。")
 	return nil
 }
 
+var timeNow = func() time.Time { return time.Now() }
+
 func quarantineCorruptedImages(ctx context.Context, paths []string, quarantinePath string, workerCount int) ([]string, int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
-	if workerCount <= 0 {
-		workerCount = 1
-	}
+	workerCount = defaultWorkerCount(workerCount)
 	healthy := make([]string, 0, len(paths))
 	corruptedDir := filepath.Join(quarantinePath, "corrupted")
 

@@ -9,7 +9,10 @@ PICs Manager 是一个基于 Go、React/TypeScript 和 MongoDB 的本地媒体�
 - 支持图片损坏检测与隔离。
 - 支持下载器常见的 `file (1).jpg` 补位语义。
 - 支持同名文件的哈希分流：同名同哈希删除重复文件，同名不同哈希进入 `.same-name/<原文件名桶>/<sha256>/<原文件名>`。
+- 支持持久化 run/journal：每次扫描都有 runId、阶段、计数、错误摘要和 JSONL 事件记录。
+- 支持 NAS 运行控制：保守默认 worker、维护时间窗口、轻量 IO 节流和目录健康报告。
 - 支持 MongoDB 入库、索引维护、文本搜索、以图搜图和缩略图懒加载。
+- 提供 systemd、Docker Compose 和 logrotate 部署模板。
 - 提供 Web UI、HTTP API、CLI 和验证工具。
 
 ## 文档

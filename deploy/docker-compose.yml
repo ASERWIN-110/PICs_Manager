@@ -1,0 +1,39 @@
+services:
+  pics-manager:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: pics-manager
+    restart: unless-stopped
+    environment:
+      DATABASE_URI: mongodb://mongodb:27017
+      DATABASE_NAME: media_manager
+      PIC_MANAGER_MAINTENANCE_TOKEN: ${PIC_MANAGER_MAINTENANCE_TOKEN:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - ./data/logs:/app/logs
+      - ./data/backups:/app/backups
+      - /srv/media/inbox:/media/inbox
+      - /srv/media/staging:/media/staging
+      - /srv/media/library:/media/library
+      - /srv/media/quarantine:/media/quarantine
+    depends_on:
+      - mongodb
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  mongodb:
+    image: mongo:7
+    container_name: pics-manager-mongodb
+    restart: unless-stopped
+    command: ["mongod", "--bind_ip_all"]
+    volumes:
+      - ./data/mongodb:/data/db
+    ports:
+      - "127.0.0.1:27017:27017"

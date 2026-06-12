@@ -1,6 +1,8 @@
 package scanner
 
 import (
+	"PICs_Manager/pkg/runstate"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +31,7 @@ func TestMergeDirectoryContentsMovesNameConflictToSameNameDirectoryWhenHashDiffe
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
-	if err := mergeDirectoryContents(srcDir, destDir, quarantineDir); err != nil {
+	if err := (&configBasedAggregator{}).mergeDirectoryContents(srcDir, destDir, quarantineDir); err != nil {
 		t.Fatalf("mergeDirectoryContents returned error: %v", err)
 	}
 
@@ -42,6 +44,43 @@ func TestMergeDirectoryContentsMovesNameConflictToSameNameDirectoryWhenHashDiffe
 	}
 	if _, err := os.Stat(srcDir); !os.IsNotExist(err) {
 		t.Fatalf("expected source directory to be removed after merge, err=%v", err)
+	}
+}
+
+func TestAggregatorRecordsMergeJournalEvents(t *testing.T) {
+	root := t.TempDir()
+	srcDir := filepath.Join(root, "src")
+	destDir := filepath.Join(root, "library", "Series")
+	if err := os.MkdirAll(srcDir, 0755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(destDir, "Series_1.jpg"), []byte("existing"), 0644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "Series_1.jpg"), []byte("new"), 0644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	store, err := runstate.NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	if err := store.Create(context.Background(), runstate.Run{ID: "run-1"}); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	aggregator := &configBasedAggregator{recorder: runstate.Recorder{Store: store, RunID: "run-1"}}
+
+	if err := aggregator.mergeDirectoryContents(srcDir, destDir, filepath.Join(root, "quarantine")); err != nil {
+		t.Fatalf("mergeDirectoryContents returned error: %v", err)
+	}
+	events, err := store.Journal(context.Background(), "run-1")
+	if err != nil {
+		t.Fatalf("Journal returned error: %v", err)
+	}
+	if !hasJournalAction(events, "file_before_merge") || !hasJournalAction(events, "file_after_merge") {
+		t.Fatalf("expected merge journal events, got %+v", events)
 	}
 }
 
@@ -65,7 +104,7 @@ func TestMergeDirectoryContentsDeletesNameConflictWhenHashMatches(t *testing.T) 
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
-	if err := mergeDirectoryContents(srcDir, destDir, filepath.Join(root, "quarantine")); err != nil {
+	if err := (&configBasedAggregator{}).mergeDirectoryContents(srcDir, destDir, filepath.Join(root, "quarantine")); err != nil {
 		t.Fatalf("mergeDirectoryContents returned error: %v", err)
 	}
 	if got, err := os.ReadFile(destFile); err != nil || string(got) != "same" {
@@ -86,7 +125,7 @@ func TestAggregatePhase3ReturnsReadDirError(t *testing.T) {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 
-	aggregator, err := NewAggregator(logDir, nil, 1)
+	aggregator, err := NewAggregatorWithMediaRoots(logDir, nil, 1, nil)
 	if err != nil {
 		t.Fatalf("NewAggregator returned error: %v", err)
 	}
@@ -109,7 +148,7 @@ func TestAggregationWorkerReportsReadDirError(t *testing.T) {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 
-	aggregator, err := NewAggregator(logDir, nil, 1)
+	aggregator, err := NewAggregatorWithMediaRoots(logDir, nil, 1, nil)
 	if err != nil {
 		t.Fatalf("NewAggregator returned error: %v", err)
 	}
@@ -153,7 +192,7 @@ func TestArchiveStagingFoldersRejectsUnexpectedFiles(t *testing.T) {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
-	aggregator, err := NewAggregator(logDir, nil, 1)
+	aggregator, err := NewAggregatorWithMediaRoots(logDir, nil, 1, nil)
 	if err != nil {
 		t.Fatalf("NewAggregator returned error: %v", err)
 	}
@@ -188,7 +227,7 @@ func TestArchiveStagingFoldersIgnoresSystemFiles(t *testing.T) {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 
-	aggregator, err := NewAggregator(logDir, nil, 1)
+	aggregator, err := NewAggregatorWithMediaRoots(logDir, nil, 1, nil)
 	if err != nil {
 		t.Fatalf("NewAggregator returned error: %v", err)
 	}

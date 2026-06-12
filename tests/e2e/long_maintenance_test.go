@@ -169,10 +169,10 @@ func TestLongMaintenanceMongoAndAPIE2E(t *testing.T) {
 	cleanupMongoCollections(t, root)
 	runCommand(t, root, cli, "-action", "scan", "-mode", "full")
 	assertMongoCollectionCounts(t, root, map[string]int64{
-		"images": 6,
-		"videos": 1,
-		"audios": 1,
-		"texts":  1,
+		"images": 7,
+		"videos": 2,
+		"audios": 2,
+		"texts":  2,
 	})
 	stats := runCommand(t, root, cli, "-action", "stats")
 	if !strings.Contains(stats, "media=") && !strings.Contains(stats, "媒体") {
@@ -180,10 +180,10 @@ func TestLongMaintenanceMongoAndAPIE2E(t *testing.T) {
 	}
 	runCommand(t, root, cli, "-action", "rebuild-database")
 	assertMongoCollectionCounts(t, root, map[string]int64{
-		"images": 6,
-		"videos": 1,
-		"audios": 1,
-		"texts":  1,
+		"images": 7,
+		"videos": 2,
+		"audios": 2,
+		"texts":  2,
 	})
 	runCommand(t, root, cli, "-action", "list-series", "-limit", "3")
 
@@ -309,6 +309,10 @@ func writeDataset(t *testing.T, root string) {
 	writeFile(t, filepath.Join(root, "Video_1.mp4"), []byte("video-bytes"))
 	writeFile(t, filepath.Join(root, "Audio_1.mp3"), []byte("audio-bytes"))
 	writeFile(t, filepath.Join(root, "Notes_1.txt"), []byte("notes"))
+	writePNG(t, filepath.Join(root, "Shared_1.png"), color.RGBA{R: 90, G: 120, B: 150, A: 255})
+	writeFile(t, filepath.Join(root, "Shared_1.mp4"), []byte("shared-video"))
+	writeFile(t, filepath.Join(root, "Shared_1.mp3"), []byte("shared-audio"))
+	writeFile(t, filepath.Join(root, "Shared_1.txt"), []byte("shared-text"))
 	writeFile(t, filepath.Join(root, "Broken_1.png"), []byte("not a png"))
 	writeFile(t, filepath.Join(root, "note.bin"), []byte("unsupported"))
 }
@@ -323,6 +327,10 @@ func assertClassifiedTree(t *testing.T, m map[string]string) {
 		filepath.Join("videos", "V", "Video", "Video_1.mp4"),
 		filepath.Join("audios", "A", "Audio", "Audio_1.mp3"),
 		filepath.Join("texts", "N", "Notes", "Notes_1.txt"),
+		filepath.Join("images", "S", "Shared", "Shared_1.png"),
+		filepath.Join("videos", "S", "Shared", "Shared_1.mp4"),
+		filepath.Join("audios", "S", "Shared", "Shared_1.mp3"),
+		filepath.Join("texts", "S", "Shared", "Shared_1.txt"),
 	} {
 		if _, ok := m[rel]; !ok {
 			t.Fatalf("classified manifest missing %s: %v", rel, sortedKeys(m))

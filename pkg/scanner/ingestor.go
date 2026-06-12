@@ -535,15 +535,16 @@ func (m *mongoIngestor) sendMediaResult(ctx context.Context, results chan<- medi
 // 并发地更新所有受影响系列的元数据
 func (m *mongoIngestor) updateAllSeriesMetadata(ctx context.Context, seriesCache map[string]*models.Series) error {
 	var wg sync.WaitGroup
-	tasks := make(chan *models.Series, len(seriesCache))
-	results := make(chan metadataUpdateResult, len(seriesCache))
+	seriesList := uniqueSeriesFromCache(seriesCache)
+	tasks := make(chan *models.Series, len(seriesList))
+	results := make(chan metadataUpdateResult, len(seriesList))
 
 	for i := 0; i < m.numWorkers; i++ {
 		wg.Add(1)
 		go m.metadataUpdateWorker(&wg, ctx, tasks, results)
 	}
 
-	for _, series := range seriesCache {
+	for _, series := range seriesList {
 		tasks <- series
 	}
 	close(tasks)
@@ -628,16 +629,22 @@ func (m *mongoIngestor) metadataUpdateWorker(wg *sync.WaitGroup, ctx context.Con
 
 func (m *mongoIngestor) reconcileAndValidateSeries(ctx context.Context, seriesCache map[string]*models.Series) error {
 	var allErrs []error
-	for seriesPath, series := range seriesCache {
-		fsFileNames, err := mediaFileNamesInDir(seriesPath, m.scannerCfg)
-		if err != nil {
-			allErrs = append(allErrs, fmt.Errorf("读取系列目录 %s 失败: %w", seriesPath, err))
-			continue
+	for _, target := range reconcileTargetsFromCache(seriesCache) {
+		fsFileNames := make(map[string]struct{})
+		for _, seriesPath := range target.paths {
+			names, err := mediaFileNamesInDir(seriesPath, m.scannerCfg)
+			if err != nil {
+				allErrs = append(allErrs, fmt.Errorf("读取系列目录 %s 失败: %w", seriesPath, err))
+				continue
+			}
+			for name := range names {
+				fsFileNames[name] = struct{}{}
+			}
 		}
 
-		dbMedia, err := m.dbStore.Images().GetAllBySeriesID(ctx, series.ID)
+		dbMedia, err := m.dbStore.Images().GetAllBySeriesID(ctx, target.series.ID)
 		if err != nil {
-			allErrs = append(allErrs, fmt.Errorf("读取系列 %s 数据库媒体失败: %w", series.Name, err))
+			allErrs = append(allErrs, fmt.Errorf("读取系列 %s 数据库媒体失败: %w", target.series.Name, err))
 			continue
 		}
 
@@ -645,27 +652,77 @@ func (m *mongoIngestor) reconcileAndValidateSeries(ctx context.Context, seriesCa
 			if _, ok := fsFileNames[item.FileName]; ok {
 				continue
 			}
-			m.logger.Printf("删除数据库中已不存在的媒体记录: series=%s file=%s", series.Name, item.FileName)
-			m.record(runstate.Event{Phase: "database_sync", Action: "media_before_delete_missing", Source: item.FilePath, Metadata: map[string]string{"series": series.Name, "fileName": item.FileName}})
+			m.logger.Printf("删除数据库中已不存在的媒体记录: series=%s file=%s", target.series.Name, item.FileName)
+			m.record(runstate.Event{Phase: "database_sync", Action: "media_before_delete_missing", Source: item.FilePath, Metadata: map[string]string{"series": target.series.Name, "fileName": item.FileName}})
 			if err := m.dbStore.Images().Delete(ctx, item.ID); err != nil {
-				allErrs = append(allErrs, fmt.Errorf("删除缺失媒体记录 %s/%s 失败: %w", series.Name, item.FileName, err))
-				m.record(runstate.Event{Phase: "database_sync", Action: "media_after_delete_missing", Source: item.FilePath, Status: "failed", Error: err.Error(), Metadata: map[string]string{"series": series.Name, "fileName": item.FileName}})
+				allErrs = append(allErrs, fmt.Errorf("删除缺失媒体记录 %s/%s 失败: %w", target.series.Name, item.FileName, err))
+				m.record(runstate.Event{Phase: "database_sync", Action: "media_after_delete_missing", Source: item.FilePath, Status: "failed", Error: err.Error(), Metadata: map[string]string{"series": target.series.Name, "fileName": item.FileName}})
 			} else {
-				m.record(runstate.Event{Phase: "database_sync", Action: "media_after_delete_missing", Source: item.FilePath, Status: "deleted", Metadata: map[string]string{"series": series.Name, "fileName": item.FileName}})
+				m.record(runstate.Event{Phase: "database_sync", Action: "media_after_delete_missing", Source: item.FilePath, Status: "deleted", Metadata: map[string]string{"series": target.series.Name, "fileName": item.FileName}})
 			}
 		}
 
-		dbCount, err := m.dbStore.Images().CountBySeriesID(ctx, series.ID)
+		dbCount, err := m.dbStore.Images().CountBySeriesID(ctx, target.series.ID)
 		if err != nil {
-			allErrs = append(allErrs, fmt.Errorf("统计系列 %s 数据库媒体失败: %w", series.Name, err))
+			allErrs = append(allErrs, fmt.Errorf("统计系列 %s 数据库媒体失败: %w", target.series.Name, err))
 			continue
 		}
 		if int64(len(fsFileNames)) != dbCount {
-			allErrs = append(allErrs, fmt.Errorf("系列 %s 数量不一致: 文件系统 %d, 数据库 %d", series.Name, len(fsFileNames), dbCount))
+			allErrs = append(allErrs, fmt.Errorf("系列 %s 数量不一致: 文件系统 %d, 数据库 %d", target.series.Name, len(fsFileNames), dbCount))
 		}
 	}
 
 	return errors.Join(allErrs...)
+}
+
+type seriesReconcileTarget struct {
+	series *models.Series
+	paths  []string
+}
+
+func reconcileTargetsFromCache(seriesCache map[string]*models.Series) []seriesReconcileTarget {
+	targetsByID := make(map[primitive.ObjectID]*seriesReconcileTarget)
+	for seriesPath, series := range seriesCache {
+		if series == nil {
+			continue
+		}
+		target, ok := targetsByID[series.ID]
+		if !ok {
+			seriesCopy := *series
+			target = &seriesReconcileTarget{series: &seriesCopy}
+			targetsByID[series.ID] = target
+		}
+		target.paths = append(target.paths, seriesPath)
+	}
+
+	targets := make([]seriesReconcileTarget, 0, len(targetsByID))
+	for _, target := range targetsByID {
+		sort.Strings(target.paths)
+		targets = append(targets, *target)
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].series.Name < targets[j].series.Name
+	})
+	return targets
+}
+
+func uniqueSeriesFromCache(seriesCache map[string]*models.Series) []*models.Series {
+	seen := make(map[primitive.ObjectID]struct{})
+	seriesList := make([]*models.Series, 0, len(seriesCache))
+	for _, series := range seriesCache {
+		if series == nil {
+			continue
+		}
+		if _, ok := seen[series.ID]; ok {
+			continue
+		}
+		seen[series.ID] = struct{}{}
+		seriesList = append(seriesList, series)
+	}
+	sort.Slice(seriesList, func(i, j int) bool {
+		return seriesList[i].Name < seriesList[j].Name
+	})
+	return seriesList
 }
 
 func recorderFromContext(ctx context.Context) runstate.Recorder {

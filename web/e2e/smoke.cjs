@@ -233,7 +233,10 @@ async function main() {
       }
 
       await cdp.eval(asExpression(() => document.querySelector('.series-card')?.click()));
-      await waitFor(cdp, () => document.querySelector('.media-tabs') && !document.querySelector('.inline-state.error'), 15000);
+      await waitFor(cdp, () => document.querySelector('.media-tabs') && !document.querySelector('.inline-state.error') && !document.body.textContent.includes('正在加载') && (
+        document.querySelectorAll('.media-tile').length > 0 ||
+        document.body.textContent.includes('这个系列还没有')
+      ), 15000);
       media = await cdp.eval(asExpression(() => {
         const tabs = [...document.querySelectorAll('.media-tab')].map(tab => tab.textContent.trim());
         const active = document.querySelector('.media-tab.active')?.textContent?.trim() || '';
@@ -250,6 +253,9 @@ async function main() {
       }
       if (media.active !== '图片') {
         throw new Error(`Expected image tab to be active by default: ${media.active}`);
+      }
+      if (media.tileCount < 1) {
+        throw new Error(`Expected at least one media tile for the first series: ${JSON.stringify(media)}`);
       }
       if (media.thumbs.length && media.thumbs.some(thumb => !thumb.src?.includes('/thumbnail') || thumb.loading !== 'lazy')) {
         throw new Error(`Media thumbnails are not lazy URL thumbnails: ${JSON.stringify(media.thumbs.slice(0, 3))}`);

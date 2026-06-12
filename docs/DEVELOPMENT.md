@@ -181,6 +181,8 @@ npm run e2e:smoke
 - 对应页面或组件
 - `web/e2e/smoke.cjs`
 
+配置页必须和 `config.Config` JSON 结构保持同步。`scanner.mediaTypes` 在后端结构为 `type/extensions/filePatterns`，前端管理页需要按媒体类型分别编辑扩展名和分类正则，不能退回到只暴露原始 JSON 文本框。
+
 ## 本地验证
 
 推荐命令：

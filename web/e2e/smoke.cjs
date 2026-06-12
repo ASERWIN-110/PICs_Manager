@@ -316,8 +316,11 @@ async function main() {
     const admin = await cdp.eval(asExpression(() => {
       const uri = document.querySelector('input[name="database.uri"]')?.value || '';
       const modeOptions = [...document.querySelectorAll('.scan-row select option')].map(option => option.value);
-      const mediaTypes = document.querySelector('.rule-list')?.textContent || '';
-      return { uri, modeOptions, mediaTypes };
+      const mediaRules = [...document.querySelectorAll('.media-rule-card')].map(card => ({
+        type: card.querySelector('.media-rule-title input')?.value || '',
+        textareas: [...card.querySelectorAll('textarea')].map(area => area.value),
+      }));
+      return { uri, modeOptions, mediaRules };
     }));
     if (!admin.uri.includes('xxxxx') || admin.uri.includes('secret')) {
       throw new Error(`Database URI is not redacted in admin UI: ${admin.uri}`);
@@ -325,8 +328,14 @@ async function main() {
     if (!admin.modeOptions.includes('full') || !admin.modeOptions.includes('classifyOnly')) {
       throw new Error(`Scan mode options missing: ${admin.modeOptions.join(',')}`);
     }
-    if (!admin.mediaTypes.includes('image')) {
-      throw new Error(`Media type rules were not rendered: ${admin.mediaTypes}`);
+    const adminTypes = admin.mediaRules.map(rule => rule.type);
+    for (const mediaType of ['image', 'video', 'audio', 'text']) {
+      if (!adminTypes.includes(mediaType)) {
+        throw new Error(`Media type rule ${mediaType} was not rendered: ${JSON.stringify(admin.mediaRules)}`);
+      }
+    }
+    if (admin.mediaRules.some(rule => rule.textareas.length < 2 || !rule.textareas[0] || !rule.textareas[1])) {
+      throw new Error(`Media type rule editors are incomplete: ${JSON.stringify(admin.mediaRules)}`);
     }
 
     if (cdp.exceptions.length || cdp.consoleErrors.length) {

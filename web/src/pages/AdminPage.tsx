@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import AddIcon from '@mui/icons-material/Add';
+import DeleteIcon from '@mui/icons-material/Delete';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import SaveIcon from '@mui/icons-material/Save';
 import type { AppConfig, MediaTypeConfig } from '../types/config';
@@ -17,6 +19,52 @@ type MutableConfigNode = Record<string, unknown>;
 
 const cloneConfig = (config: AppConfig): AppConfig => JSON.parse(JSON.stringify(config)) as AppConfig;
 
+const splitExtensions = (value: string): string[] => value
+    .split(/[\n,]+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+
+const splitPatterns = (value: string): string[] => value
+    .split('\n')
+    .filter(item => item.trim() !== '');
+
+const joinLines = (value: string[]): string => value.join('\n');
+
+const validateMediaTypes = (mediaTypes: MediaTypeConfig[]): string => {
+    const seen = new Set<string>();
+    for (let index = 0; index < mediaTypes.length; index += 1) {
+        const item = mediaTypes[index];
+        const type = item.type.trim();
+        if (!type) {
+            return `第 ${index + 1} 个媒体类型缺少 type`;
+        }
+        if (seen.has(type)) {
+            return `媒体类型 ${type} 重复`;
+        }
+        seen.add(type);
+        if (item.extensions.length === 0) {
+            return `${type} 至少需要一个扩展名`;
+        }
+        if (item.filePatterns.length === 0) {
+            return `${type} 至少需要一个分类正则`;
+        }
+    }
+    return '';
+};
+
+const nextCustomType = (mediaTypes: MediaTypeConfig[]): string => {
+    const existing = new Set(mediaTypes.map(item => item.type));
+    if (!existing.has('custom')) {
+        return 'custom';
+    }
+    for (let index = 2; ; index += 1) {
+        const candidate = `custom_${index}`;
+        if (!existing.has(candidate)) {
+            return candidate;
+        }
+    }
+};
+
 const ConfigInput = ({ label, name, value, onChange, type = 'text', disabled = false }: ConfigInputProps) => (
     <label className="form-row">
         <span>{label}</span>
@@ -28,8 +76,6 @@ const AdminPage = () => {
     const [config, setConfig] = useState<AppConfig | null>(null);
     const [configMessage, setConfigMessage] = useState('');
     const [configError, setConfigError] = useState('');
-    const [mediaTypesText, setMediaTypesText] = useState('');
-    const [mediaTypesError, setMediaTypesError] = useState('');
     const [scanPath, setScanPath] = useState('');
     const [scanMode, setScanMode] = useState('full');
     const [taskMessage, setTaskMessage] = useState('');
@@ -47,7 +93,6 @@ const AdminPage = () => {
             setConfig(data);
             setScanPath(data.scanner.scanPath ?? '');
             setScanMode(data.scanner.mode || 'full');
-            setMediaTypesText(JSON.stringify(data.scanner.mediaTypes ?? [], null, 2));
         }).catch(err => {
             console.error(err);
             if (isMountedRef.current) {
@@ -72,6 +117,13 @@ const AdminPage = () => {
         return config.scanner.mediaTypes
             .map(item => `${item.type}: ${item.extensions.join(', ')}`)
             .join(' | ');
+    }, [config]);
+
+    const mediaTypesError = useMemo(() => {
+        if (!config) {
+            return '';
+        }
+        return validateMediaTypes(config.scanner.mediaTypes ?? []);
     }, [config]);
 
     const handleConfigChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -109,29 +161,57 @@ const AdminPage = () => {
         setConfig(prevConfig => {
             if (!prevConfig) return null;
             const nextConfig = cloneConfig(prevConfig);
-            nextConfig.scanner.filePatterns = value.split('\n').map(pattern => pattern.trim()).filter(Boolean);
+            nextConfig.scanner.filePatterns = splitPatterns(value);
             return nextConfig;
         });
     };
 
-    const handleMediaTypesChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-        const { value } = event.target;
-        setMediaTypesText(value);
-        try {
-            const parsed = JSON.parse(value) as MediaTypeConfig[];
-            if (!Array.isArray(parsed)) {
-                throw new Error('mediaTypes 必须是数组');
-            }
-            setMediaTypesError('');
-            setConfig(prevConfig => {
-                if (!prevConfig) return null;
-                const nextConfig = cloneConfig(prevConfig);
-                nextConfig.scanner.mediaTypes = parsed;
-                return nextConfig;
-            });
-        } catch (err) {
-            setMediaTypesError(err instanceof Error ? err.message : 'mediaTypes JSON 无效');
-        }
+    const updateMediaType = (index: number, updater: (item: MediaTypeConfig) => MediaTypeConfig) => {
+        setConfig(prevConfig => {
+            if (!prevConfig) return null;
+            const nextConfig = cloneConfig(prevConfig);
+            nextConfig.scanner.mediaTypes = nextConfig.scanner.mediaTypes.map((item, itemIndex) => (
+                itemIndex === index ? updater(item) : item
+            ));
+            return nextConfig;
+        });
+    };
+
+    const handleMediaTypeNameChange = (index: number, value: string) => {
+        updateMediaType(index, item => ({ ...item, type: value.trim() }));
+    };
+
+    const handleMediaTypeExtensionsChange = (index: number, value: string) => {
+        updateMediaType(index, item => ({ ...item, extensions: splitExtensions(value) }));
+    };
+
+    const handleMediaTypePatternsChange = (index: number, value: string) => {
+        updateMediaType(index, item => ({ ...item, filePatterns: splitPatterns(value) }));
+    };
+
+    const handleAddMediaType = () => {
+        setConfig(prevConfig => {
+            if (!prevConfig) return null;
+            const nextConfig = cloneConfig(prevConfig);
+            nextConfig.scanner.mediaTypes = [
+                ...nextConfig.scanner.mediaTypes,
+                {
+                    type: nextCustomType(nextConfig.scanner.mediaTypes),
+                    extensions: ['.ext'],
+                    filePatterns: ['^(.*?)_(\\d+)(\\.[a-zA-Z0-9_]+)?$'],
+                },
+            ];
+            return nextConfig;
+        });
+    };
+
+    const handleRemoveMediaType = (index: number) => {
+        setConfig(prevConfig => {
+            if (!prevConfig) return null;
+            const nextConfig = cloneConfig(prevConfig);
+            nextConfig.scanner.mediaTypes = nextConfig.scanner.mediaTypes.filter((_, itemIndex) => itemIndex !== index);
+            return nextConfig;
+        });
     };
 
     const handleSaveConfig = async (event: React.FormEvent) => {
@@ -149,7 +229,6 @@ const AdminPage = () => {
                 return;
             }
             setConfig(saved);
-            setMediaTypesText(JSON.stringify(saved.scanner.mediaTypes ?? [], null, 2));
             setConfigMessage('配置已保存。');
         } catch (err) {
             console.error(err);
@@ -319,23 +398,55 @@ const AdminPage = () => {
                         />
                     </label>
 
-                    <label className="text-area-field">
-                        <span>媒体类型规则 JSON</span>
-                        <textarea
-                            value={mediaTypesText}
-                            onChange={handleMediaTypesChange}
-                            spellCheck={false}
-                            className={mediaTypesError ? 'invalid' : ''}
-                        />
-                    </label>
-                    {mediaTypesError && <div className="error-banner">mediaTypes JSON 无效: {mediaTypesError}</div>}
+                    <div className="media-rule-header">
+                        <h3>媒体类型规则</h3>
+                        <button className="button secondary" type="button" onClick={handleAddMediaType}>
+                            <AddIcon fontSize="small" />
+                            新增类型
+                        </button>
+                    </div>
+                    {mediaTypesError && <div className="error-banner">媒体类型配置无效: {mediaTypesError}</div>}
 
-                    <div className="rule-list">
-                        {config.scanner.mediaTypes.map((item) => (
-                            <div key={item.type} className="rule-chip">
-                                <strong>{item.type}</strong>
-                                <span>{item.extensions.join(', ')}</span>
-                            </div>
+                    <div className="media-rule-list">
+                        {config.scanner.mediaTypes.map((item, index) => (
+                            <section key={`${item.type}-${index}`} className="media-rule-card">
+                                <div className="media-rule-title">
+                                    <label className="form-row compact">
+                                        <span>类型</span>
+                                        <input
+                                            type="text"
+                                            value={item.type}
+                                            onChange={(event) => handleMediaTypeNameChange(index, event.target.value)}
+                                        />
+                                    </label>
+                                    <button
+                                        className="icon-button danger"
+                                        type="button"
+                                        onClick={() => handleRemoveMediaType(index)}
+                                        aria-label={`删除 ${item.type || '媒体类型'}`}
+                                    >
+                                        <DeleteIcon fontSize="small" />
+                                    </button>
+                                </div>
+
+                                <label className="text-area-field">
+                                    <span>扩展名</span>
+                                    <textarea
+                                        value={item.extensions.join(', ')}
+                                        onChange={(event) => handleMediaTypeExtensionsChange(index, event.target.value)}
+                                        spellCheck={false}
+                                    />
+                                </label>
+
+                                <label className="text-area-field">
+                                    <span>分类正则</span>
+                                    <textarea
+                                        value={joinLines(item.filePatterns)}
+                                        onChange={(event) => handleMediaTypePatternsChange(index, event.target.value)}
+                                        spellCheck={false}
+                                    />
+                                </label>
+                            </section>
                         ))}
                     </div>
 

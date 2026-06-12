@@ -102,6 +102,14 @@ scanner:
 
 最终库物理目录和 MongoDB 物理集合都会按媒体类型拆分：图片使用 `images`，视频使用 `videos`，音频使用 `audios`，文本使用 `texts`，自定义类型使用 `media_<type>`。例如视频文件会落到 `<finalLibraryPath>/videos/V/Video/Video_1.mp4`，并写入 MongoDB 的 `videos` 集合。查看 API 和前端也按媒体类型分页查询，不会把图片、视频、音频、文本混在同一个列表里。
 
+Web 管理页的“分类规则”区域会按媒体类型显示独立规则卡片。每张卡片可以单独编辑：
+
+- `type`：媒体类型名，例如 `image`、`video`、`audio`、`text`。
+- `extensions`：该类型支持的扩展名。
+- `filePatterns`：该类型自己的分类正则，一行一个。
+
+保存后会写回 `scanner.mediaTypes`。后端仍会在保存时做配置校验；正则公式不会被前端自动改写。
+
 ## 同名文件处理
 
 同一个系列目录下如果出现同名文件：
@@ -362,8 +370,8 @@ go run ./cmd/verify-scan \
 下载对应平台包后解压：
 
 ```bash
-tar -xzf PICs_Manager_v0.1.1_linux_amd64.tar.gz
-cd PICs_Manager_v0.1.1_linux_amd64
+tar -xzf PICs_Manager_v0.1.2_linux_amd64.tar.gz
+cd PICs_Manager_v0.1.2_linux_amd64
 ```
 
 修改 `config.yaml`，然后运行：

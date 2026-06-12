@@ -1,0 +1,302 @@
+package config
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/spf13/viper"
+)
+
+type SeriesGroupRule struct {
+	Name    string `mapstructure:"name" json:"name" yaml:"name"`
+	Pattern string `mapstructure:"pattern" json:"pattern" yaml:"pattern"`
+}
+
+type MediaTypeConfig struct {
+	Type         string   `mapstructure:"type" json:"type" yaml:"type"`
+	Extensions   []string `mapstructure:"extensions" json:"extensions" yaml:"extensions"`
+	FilePatterns []string `mapstructure:"filePatterns" json:"filePatterns" yaml:"filePatterns"`
+}
+
+type ScannerConfig struct {
+	Mode              string            `mapstructure:"mode" json:"mode" yaml:"mode"`
+	ScanPath          string            `mapstructure:"scanPath" json:"scanPath" yaml:"scanPath"`
+	StagingPath       string            `mapstructure:"stagingPath" json:"stagingPath" yaml:"stagingPath"`
+	FinalLibraryPath  string            `mapstructure:"finalLibraryPath" json:"finalLibraryPath" yaml:"finalLibraryPath"`
+	BackupPath        string            `mapstructure:"backupPath" json:"backupPath" yaml:"backupPath"`
+	QuarantinePath    string            `mapstructure:"quarantinePath" json:"quarantinePath" yaml:"quarantinePath"`
+	CorruptionLogPath string            `mapstructure:"corruptionLogPath" json:"corruptionLogPath" yaml:"corruptionLogPath"`
+	DuplicatesDir     string            `mapstructure:"duplicatesDir" json:"duplicatesDir" yaml:"duplicatesDir"`
+	WorkerCount       int               `mapstructure:"workerCount" json:"workerCount" yaml:"workerCount"`
+	BatchSize         int               `mapstructure:"batchSize" json:"batchSize" yaml:"batchSize"`
+	FilePatterns      []string          `mapstructure:"filePatterns" json:"filePatterns" yaml:"filePatterns"`
+	MediaTypes        []MediaTypeConfig `mapstructure:"mediaTypes" json:"mediaTypes" yaml:"mediaTypes"`
+	SeriesGroupRules  []SeriesGroupRule `mapstructure:"seriesGroupPatterns" json:"seriesGroupPatterns" yaml:"seriesGroupPatterns"`
+}
+
+type ServerConfig struct {
+	Port    string        `mapstructure:"port" yaml:"port"`
+	Timeout time.Duration `mapstructure:"timeout" yaml:"timeout"`
+}
+
+func (s ServerConfig) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Port    string `json:"port"`
+		Timeout string `json:"timeout"`
+	}{
+		Port:    s.Port,
+		Timeout: s.Timeout.String(),
+	})
+}
+
+func (s *ServerConfig) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Port    string          `json:"port"`
+		Timeout json.RawMessage `json:"timeout"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+
+	s.Port = wire.Port
+	if len(wire.Timeout) == 0 || string(wire.Timeout) == "null" {
+		return nil
+	}
+
+	var timeoutStr string
+	if err := json.Unmarshal(wire.Timeout, &timeoutStr); err == nil {
+		timeout, parseErr := time.ParseDuration(timeoutStr)
+		if parseErr != nil {
+			return fmt.Errorf("invalid server.timeout %q: %w", timeoutStr, parseErr)
+		}
+		s.Timeout = timeout
+		return nil
+	}
+
+	var timeoutNanos int64
+	if err := json.Unmarshal(wire.Timeout, &timeoutNanos); err == nil {
+		s.Timeout = time.Duration(timeoutNanos)
+		return nil
+	}
+
+	return fmt.Errorf("invalid server.timeout: %s", strconv.Quote(string(wire.Timeout)))
+}
+
+func (s ServerConfig) MarshalYAML() (interface{}, error) {
+	return struct {
+		Port    string `yaml:"port"`
+		Timeout string `yaml:"timeout"`
+	}{
+		Port:    s.Port,
+		Timeout: s.Timeout.String(),
+	}, nil
+}
+
+type DatabaseConfig struct {
+	URI  string `mapstructure:"uri" json:"uri" yaml:"uri"`
+	Name string `mapstructure:"name" json:"name" yaml:"name"`
+}
+
+type LoggerConfig struct {
+	Level  string `mapstructure:"level" json:"level" yaml:"level"`
+	Format string `mapstructure:"format" json:"format" yaml:"format"`
+	Path   string `mapstructure:"path" json:"path" yaml:"path"`
+}
+
+type Config struct {
+	Server   ServerConfig   `mapstructure:"server" json:"server" yaml:"server"`
+	Database DatabaseConfig `mapstructure:"database" json:"database" yaml:"database"`
+	Logger   LoggerConfig   `mapstructure:"logger" json:"logger" yaml:"logger"`
+	Scanner  ScannerConfig  `mapstructure:"scanner" json:"scanner" yaml:"scanner"`
+}
+
+var C *Config
+
+func LoadConfig(path string) (err error) {
+	if err = loadOptionalEnvFile(); err != nil {
+		return err
+	}
+
+	v := viper.New()
+	v.AddConfigPath(path)
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AutomaticEnv()
+
+	if err = v.ReadInConfig(); err != nil {
+		return
+	}
+
+	if err = v.Unmarshal(&C); err != nil {
+		return
+	}
+	applyEnvOverrides(C)
+	return ValidateConfig(*C)
+}
+
+func loadOptionalEnvFile() error {
+	envFile := strings.TrimSpace(os.Getenv("PIC_MANAGER_ENV_FILE"))
+	explicitPath := envFile != ""
+	if envFile == "" {
+		envFile = "/home/darkman/dev/mongodb/config/.env"
+	}
+	file, err := os.Open(envFile)
+	if err != nil {
+		if explicitPath {
+			return fmt.Errorf("无法读取环境变量文件 %s: %w", envFile, err)
+		}
+		return nil
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("设置环境变量 %s 失败: %w", key, err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取环境变量文件 %s 失败: %w", envFile, err)
+	}
+	return nil
+}
+
+func applyEnvOverrides(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	if port := firstEnv("SERVER_PORT", "PIC_MANAGER_SERVER_PORT"); port != "" {
+		cfg.Server.Port = port
+	}
+	if uri := firstEnv("DATABASE_URI", "MONGO_URI"); uri != "" {
+		cfg.Database.URI = uri
+	}
+	if dbName := firstEnv("DATABASE_NAME", "MONGO_DATABASE"); dbName != "" {
+		cfg.Database.Name = dbName
+	}
+
+	username := os.Getenv("MONGO_APP_USERNAME")
+	password := os.Getenv("MONGO_APP_PASSWORD")
+	if username == "" || password == "" {
+		return
+	}
+	cfg.Database.URI = withMongoCredentials(
+		cfg.Database.URI,
+		username,
+		password,
+		firstEnv("MONGO_APP_AUTH_SOURCE", "MONGO_AUTH_SOURCE"),
+	)
+}
+
+func firstEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func withMongoCredentials(rawURI, username, password, authSource string) string {
+	if strings.TrimSpace(rawURI) == "" {
+		rawURI = "mongodb://localhost:27017"
+	}
+	parsed, err := url.Parse(rawURI)
+	if err != nil {
+		return rawURI
+	}
+	parsed.User = url.UserPassword(username, password)
+	if strings.TrimSpace(authSource) == "" {
+		authSource = "admin"
+	}
+	query := parsed.Query()
+	if query.Get("authSource") == "" {
+		query.Set("authSource", authSource)
+	}
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func ValidateConfig(cfg Config) error {
+	loggerFormat := strings.ToLower(strings.TrimSpace(cfg.Logger.Format))
+	if loggerFormat != "" && loggerFormat != "text" && loggerFormat != "json" {
+		return fmt.Errorf("logger.format must be text or json, got %q", cfg.Logger.Format)
+	}
+
+	mode := strings.TrimSpace(cfg.Scanner.Mode)
+	if mode != "" && mode != "full" && mode != "classifyOnly" {
+		return fmt.Errorf("scanner.mode must be full or classifyOnly, got %q", cfg.Scanner.Mode)
+	}
+	if cfg.Scanner.WorkerCount < 0 {
+		return fmt.Errorf("scanner.workerCount must be >= 0, got %d", cfg.Scanner.WorkerCount)
+	}
+	if cfg.Scanner.BatchSize < 0 {
+		return fmt.Errorf("scanner.batchSize must be >= 0, got %d", cfg.Scanner.BatchSize)
+	}
+	for _, pattern := range cfg.Scanner.FilePatterns {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("scanner.filePatterns contains invalid regex %q: %w", pattern, err)
+		}
+	}
+	for i, mediaType := range cfg.Scanner.MediaTypes {
+		typ := strings.TrimSpace(mediaType.Type)
+		if typ == "" {
+			return fmt.Errorf("scanner.mediaTypes[%d].type is required", i)
+		}
+		if len(mediaType.Extensions) == 0 {
+			return fmt.Errorf("scanner.mediaTypes[%d].extensions must not be empty", i)
+		}
+		for _, ext := range mediaType.Extensions {
+			if strings.TrimSpace(ext) == "" {
+				return fmt.Errorf("scanner.mediaTypes[%d].extensions contains an empty extension", i)
+			}
+		}
+		patterns := mediaType.FilePatterns
+		if strings.EqualFold(typ, "image") && len(patterns) == 0 {
+			patterns = cfg.Scanner.FilePatterns
+		}
+		if len(patterns) == 0 {
+			return fmt.Errorf("scanner.mediaTypes[%d].filePatterns must not be empty", i)
+		}
+		for _, pattern := range patterns {
+			if _, err := regexp.Compile(pattern); err != nil {
+				return fmt.Errorf("scanner.mediaTypes[%d].filePatterns contains invalid regex %q: %w", i, pattern, err)
+			}
+		}
+	}
+	if len(cfg.Scanner.MediaTypes) == 0 && len(cfg.Scanner.FilePatterns) == 0 {
+		return fmt.Errorf("scanner.filePatterns or scanner.mediaTypes must be configured")
+	}
+	for i, rule := range cfg.Scanner.SeriesGroupRules {
+		if strings.TrimSpace(rule.Pattern) == "" {
+			return fmt.Errorf("scanner.seriesGroupPatterns[%d].pattern is required", i)
+		}
+		if _, err := regexp.Compile(rule.Pattern); err != nil {
+			return fmt.Errorf("scanner.seriesGroupPatterns[%d].pattern contains invalid regex %q: %w", i, rule.Pattern, err)
+		}
+	}
+	return nil
+}

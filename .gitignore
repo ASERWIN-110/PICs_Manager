@@ -1,0 +1,23 @@
+node_modules/
+web/node_modules/
+dist/
+web/dist/
+
+*.log
+logs/
+
+.env
+.env.*
+
+tmp/
+temp/
+.verify-work/
+
+# Local media datasets used for manual verification.
+Pictures/
+test_img/
+timetable.png
+
+*.exe
+*.test
+*.out

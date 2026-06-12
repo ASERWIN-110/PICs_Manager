@@ -102,6 +102,9 @@ func (h *APIHandlers) allowUnauthenticated(required security.Scope, r *http.Requ
 		if config.C != nil {
 			token = strings.TrimSpace(config.C.Server.MaintenanceToken)
 		}
+		if token == "" && required == security.ScopeAdmin {
+			return isLocalRequest(r)
+		}
 		return token == ""
 	}
 	if required == security.ScopeViewer && !config.C.Security.RequireViewerForRead {

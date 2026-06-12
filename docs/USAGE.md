@@ -140,6 +140,7 @@ go run ./cmd/cli -action revoke-device -device-id '<deviceId>'
 
 远程安全限制：
 
+- 未启用 `security.enabled` 且没有配置旧版 `server.maintenanceToken` 时，配置接口仍只允许本机访问。
 - 非本机请求即使带 admin token，也不能修改数据库、日志目录、服务端端口和扫描关键路径。
 - 非本机请求启动扫描时，只能使用配置中的 `scanner.scanPath`，请求体里的任意 path 会被忽略。
 - 本机请求在 `security.allowLocalAdmin: true` 时可用于完整维护配置，适合 SSH 到 NAS 后操作。
@@ -450,8 +451,8 @@ go run ./cmd/verify-scan \
 下载对应平台包后解压：
 
 ```bash
-tar -xzf PICs_Manager_v0.1.4_linux_amd64.tar.gz
-cd PICs_Manager_v0.1.4_linux_amd64
+tar -xzf PICs_Manager_v0.1.5_linux_amd64.tar.gz
+cd PICs_Manager_v0.1.5_linux_amd64
 ```
 
 修改 `config.yaml`，然后运行：

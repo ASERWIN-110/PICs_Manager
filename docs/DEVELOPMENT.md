@@ -123,6 +123,7 @@ API route 必须显式声明 scope：
 
 远程请求限制：
 
+- `security.enabled=false` 且未配置旧版 `server.maintenanceToken` 时，admin scope 接口只能被本机请求访问。
 - `PUT /config` 在 `security.enabled` 且非本机请求时必须保留数据库、日志、端口、超时和所有扫描关键路径。
 - `POST /tasks` 在同样条件下必须忽略请求体 path，改用 `config.C.Scanner.ScanPath`。
 - 下载接口只接受数据库 ObjectID，经 `safeLibraryPath` 校验后读取文件；不能新增按 path 下载的接口。

@@ -135,6 +135,30 @@ func TestDevicePairingAndScopeAuth(t *testing.T) {
 	}
 }
 
+func TestAdminRoutesAreLocalOnlyWhenSecurityDisabledAndNoLegacyToken(t *testing.T) {
+	oldConfig := config.C
+	config.C = &config.Config{}
+	defer func() { config.C = oldConfig }()
+
+	router := RegisterRoutesWithRunStore(nil, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	req.RemoteAddr = "203.0.113.10:12345"
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected remote admin request to be unauthorized, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected local admin request to be allowed, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func claimToken(t *testing.T, router http.Handler, code, deviceName string) string {
 	t.Helper()
 	payload, err := json.Marshal(map[string]string{"code": code, "deviceName": deviceName})

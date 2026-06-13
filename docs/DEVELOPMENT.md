@@ -103,7 +103,7 @@ NAS 运行控制字段：
 - `security.allowLocalAdmin`：本机 admin 配置豁免。
 - `scheduler.*`：无人值守调度。
 - `runRetention.*`：已结束 run/journal 清理策略。
-- `server.maintenanceToken`：旧版兼容维护 token。新功能应优先走 `pkg/security`。
+- `server.maintenanceToken`：旧版兼容维护 token，只保护 maintainer/admin scope，不保护 viewer scope。新功能应优先走 `pkg/security`。
 
 ## 安全边界
 
@@ -124,6 +124,7 @@ API route 必须显式声明 scope：
 远程请求限制：
 
 - `security.enabled=false` 且未配置旧版 `server.maintenanceToken` 时，admin scope 接口只能被本机请求访问。
+- `security.enabled=false` 且配置了旧版 `server.maintenanceToken` 时，viewer scope 必须保持开放，maintainer/admin scope 必须校验旧 token。
 - `PUT /config` 在 `security.enabled` 且非本机请求时必须保留数据库、日志、端口、超时和所有扫描关键路径。
 - `POST /tasks` 在同样条件下必须忽略请求体 path，改用 `config.C.Scanner.ScanPath`。
 - 下载接口只接受数据库 ObjectID，经 `safeLibraryPath` 校验后读取文件；不能新增按 path 下载的接口。
@@ -211,7 +212,7 @@ POST   /api/v1/tasks/{taskId}/pause
 PUT    /api/v1/config
 ```
 
-设置 `server.maintenanceToken` 后，上述维护 API 必须带 token；开启 `security.enabled` 后按 scope 鉴权，旧 token 仅作为 admin 兼容入口。
+设置 `server.maintenanceToken` 后，上述维护 API 必须带 token，viewer API 保持开放；开启 `security.enabled` 后按 scope 鉴权，旧 token 仅作为 admin 兼容入口。
 
 ## 前端约定
 
@@ -252,6 +253,14 @@ cd web && npm run e2e:smoke
 ```
 
 如果 Go 默认 cache 在只读目录，使用 `GOCACHE=/tmp/pics-manager-gocache`。
+
+前端 smoke 支持通过环境变量注入已有 token，用于测试受保护的 admin 页面：
+
+```bash
+E2E_DEVICE_TOKEN='<viewer/maintainer/admin-or-legacy-token>' npm --prefix web run e2e:smoke
+```
+
+该 token 会在页面加载前写入浏览器 `localStorage` 的 `pics-manager-device-token`。
 
 ## 验证工具
 

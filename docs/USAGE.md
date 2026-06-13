@@ -98,7 +98,7 @@ NAS 长期运行相关字段：
 - `maxFilesPerDir`：目录健康报告阈值。单目录文件数超过该值会写入报告 warnings。
 - `followSymlinks`：默认 `false`，扫描和下载都会跳过 symlink。设为 `true` 后会解析真实路径，并要求真实路径仍在扫描根或最终库内。
 
-`server.maintenanceToken` 是旧版兼容 token。新部署建议使用 `security` 设备绑定。
+`server.maintenanceToken` 是旧版兼容 token，只用于保护维护接口和 admin 配置接口；查看、搜索、缩略图和下载不会因为它被锁住。需要让查看端也必须配对时，开启 `security.enabled` 并保持 `security.requireViewerForRead: true`。新部署建议使用 `security` 设备绑定。
 
 `scheduler` 可让后端按固定间隔自动触发扫描。调度器和手工 CLI/API 共用 runstate 维护锁，如果已有任务运行，本轮调度会跳过。
 
@@ -141,6 +141,7 @@ go run ./cmd/cli -action revoke-device -device-id '<deviceId>'
 远程安全限制：
 
 - 未启用 `security.enabled` 且没有配置旧版 `server.maintenanceToken` 时，配置接口仍只允许本机访问。
+- 配置了旧版 `server.maintenanceToken` 时，远程维护/admin 请求必须带 `Authorization: Bearer <token>` 或 `X-Maintenance-Token: <token>`；viewer 查看请求仍保持开放。
 - 非本机请求即使带 admin token，也不能修改数据库、日志目录、服务端端口和扫描关键路径。
 - 非本机请求启动扫描时，只能使用配置中的 `scanner.scanPath`，请求体里的任意 path 会被忽略。
 - 本机请求在 `security.allowLocalAdmin: true` 时可用于完整维护配置，适合 SSH 到 NAS 后操作。

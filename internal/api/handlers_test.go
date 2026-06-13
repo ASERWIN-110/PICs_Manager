@@ -80,6 +80,21 @@ func TestMaintenanceRoutesRequireTokenWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestLegacyMaintenanceTokenDoesNotBlockViewerRoutes(t *testing.T) {
+	oldConfig := config.C
+	config.C = &config.Config{Server: config.ServerConfig{MaintenanceToken: "secret"}}
+	defer func() { config.C = oldConfig }()
+
+	router := RegisterRoutesWithRunStore(nil, apiFakeStore{})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/series", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected viewer route to remain open with legacy token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDevicePairingAndScopeAuth(t *testing.T) {
 	oldConfig := config.C
 	config.C = &config.Config{

@@ -9,6 +9,7 @@ const CHROME_BIN = process.env.CHROME_BIN || '/usr/bin/google-chrome';
 const DEBUG_PORT = Number(process.env.E2E_CHROME_PORT || 9333);
 const DEBUG_URL = `http://127.0.0.1:${DEBUG_PORT}`;
 const IMAGE_SEARCH_FILE = process.env.E2E_IMAGE_SEARCH_FILE || path.resolve(__dirname, '../../Pictures/0307_142002427_p1.jpg');
+const DEVICE_TOKEN = process.env.E2E_DEVICE_TOKEN || '';
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -177,6 +178,11 @@ async function main() {
     await cdp.send('Runtime.enable');
     await cdp.send('Page.enable');
     await cdp.send('Log.enable');
+    if (DEVICE_TOKEN) {
+      await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+        source: `localStorage.setItem('pics-manager-device-token', ${JSON.stringify(DEVICE_TOKEN)});`,
+      });
+    }
     await cdp.send('Page.navigate', { url: FRONTEND_URL });
 
     await waitFor(cdp, () => document.readyState === 'complete');

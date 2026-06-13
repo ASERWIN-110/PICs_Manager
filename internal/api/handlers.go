@@ -1114,27 +1114,18 @@ func safeConfigForResponse(cfg *config.Config) *config.Config {
 		return nil
 	}
 	safe := *cfg
-	safe.Database.URI = redactURISecret(safe.Database.URI)
+	safe.Database.URI = redactURIForResponse(safe.Database.URI)
 	if safe.Server.MaintenanceToken != "" {
 		safe.Server.MaintenanceToken = "xxxxx"
 	}
 	return &safe
 }
 
-func redactURISecret(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User == nil {
-		return raw
+func redactURIForResponse(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
 	}
-	username := parsed.User.Username()
-	if username == "" {
-		parsed.User = url.UserPassword("", "xxxxx")
-		return parsed.String()
-	}
-	if _, hasPassword := parsed.User.Password(); hasPassword {
-		parsed.User = url.UserPassword(username, "xxxxx")
-	}
-	return parsed.String()
+	return "mongodb://xxxxx:xxxxx@xxxxx"
 }
 
 func sanitizeURIForConfigFile(raw string) string {

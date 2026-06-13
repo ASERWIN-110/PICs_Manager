@@ -39,8 +39,8 @@ cp .env.example .env
 
 编辑 `.env`：
 
-- `PICS_MEDIA_ROOT` 指向 NAS 上的媒体根目录。该目录下需要有 `inbox/staging/library/quarantine` 四个子目录。
-- `PICS_DATA_ROOT` 指向应用数据目录，用于 MongoDB、日志、备份和设备绑定 token hash。
+- `PICS_MEDIA_ROOT` 指向 NAS 上的媒体根目录。Compose 会把这个根目录整体挂载到容器 `/media`，该目录下需要有 `inbox/staging/library/quarantine` 四个子目录。不要把这些子目录分别挂载，否则分类移动会遇到跨挂载点 `rename` 失败。
+- `PICS_DATA_ROOT` 指向应用数据目录，会整体挂载到容器 `/data`，用于 MongoDB、日志、备份和设备绑定 token hash。
 - `PUID/PGID` 设置为拥有媒体目录读写权限的 NAS 用户。
 - `PICS_WEB_API_BASE_URL` 必须是浏览器能访问到的 API 地址，例如 `http://nas-tailnet-name:8080/api/v1`。
 
@@ -76,7 +76,7 @@ docker compose logs -f pics-manager
 
 默认后端和前端都绑定到 `127.0.0.1`，适合由 NAS 自带反向代理或 Tailscale 入口转发。MongoDB 不映射到宿主端口，只给 compose 内部访问。
 
-配置文件 `deploy/nas/config.yaml` 是可写挂载，admin 页面保存配置会写回该文件。长期运行前建议确认它和 `PICS_DATA_ROOT`、`PICS_MEDIA_ROOT` 都由 `PUID/PGID` 对应用户拥有。
+配置文件 `deploy/nas/config.yaml` 是可写挂载，admin 页面保存配置会写回该文件。容器启动时会创建并修正 `/data`、`/media` 下几个挂载根目录的 owner，但不会递归 chown 整个媒体库；长期运行前仍建议确认 `PICS_DATA_ROOT`、`PICS_MEDIA_ROOT` 由 `PUID/PGID` 对应用户拥有。
 
 ## 日志滚动
 

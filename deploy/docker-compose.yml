@@ -3,27 +3,23 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    container_name: pics-manager
     restart: unless-stopped
-    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       DATABASE_URI: mongodb://mongodb:27017
       DATABASE_NAME: ${DATABASE_NAME:-media_manager}
       PIC_MANAGER_MAINTENANCE_TOKEN: ${PIC_MANAGER_MAINTENANCE_TOKEN:-}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
     ports:
       - "${PICS_API_BIND:-127.0.0.1}:${PICS_API_PORT:-8080}:8080"
     volumes:
       - ./nas/config.yaml:/app/config.yaml
-      - ${PICS_DATA_ROOT:-./data}/logs:/data/logs
-      - ${PICS_DATA_ROOT:-./data}/backups:/data/backups
-      - ${PICS_MEDIA_ROOT:-/srv/media}/inbox:/media/inbox
-      - ${PICS_MEDIA_ROOT:-/srv/media}/staging:/media/staging
-      - ${PICS_MEDIA_ROOT:-/srv/media}/library:/media/library
-      - ${PICS_MEDIA_ROOT:-/srv/media}/quarantine:/media/quarantine
+      - ${PICS_DATA_ROOT:-./data}:/data
+      - ${PICS_MEDIA_ROOT:-/srv/media}:/media
     depends_on:
       - mongodb
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -35,7 +31,6 @@ services:
       dockerfile: Dockerfile.web
       args:
         VITE_API_BASE_URL: ${PICS_WEB_API_BASE_URL:-http://127.0.0.1:8080/api/v1}
-    container_name: pics-manager-web
     restart: unless-stopped
     ports:
       - "${PICS_WEB_BIND:-127.0.0.1}:${PICS_WEB_PORT:-5173}:80"
@@ -50,7 +45,6 @@ services:
 
   mongodb:
     image: mongo:7
-    container_name: pics-manager-mongodb
     restart: unless-stopped
     command: ["mongod", "--bind_ip_all"]
     volumes:

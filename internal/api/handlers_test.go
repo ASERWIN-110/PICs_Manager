@@ -948,6 +948,34 @@ func TestHandleGetConfigRedactsDatabasePassword(t *testing.T) {
 	}
 }
 
+func TestHandleGetConfigRedactsDatabaseURIWithoutCredentials(t *testing.T) {
+	oldConfig := config.C
+	t.Cleanup(func() { config.C = oldConfig })
+	config.C = &config.Config{
+		Database: config.DatabaseConfig{
+			URI: "mongodb://mongodb:27017",
+		},
+		Scanner: config.ScannerConfig{
+			FilePatterns: []string{`^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$`},
+		},
+	}
+	handlers := NewAPIHandlersWithRunStore(nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	rec := httptest.NewRecorder()
+
+	handlers.HandleGetConfig(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "mongodb:27017") {
+		t.Fatalf("config response leaked database host: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "mongodb://xxxxx:xxxxx@xxxxx") {
+		t.Fatalf("expected redacted URI placeholder in response: %s", rec.Body.String())
+	}
+}
+
 func TestHandleUpdateConfigPreservesRuntimeSecretAndWritesSanitizedURI(t *testing.T) {
 	oldConfig := config.C
 	t.Cleanup(func() { config.C = oldConfig })

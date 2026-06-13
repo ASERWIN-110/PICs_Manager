@@ -358,6 +358,8 @@ Docker 部署文件：
 - `deploy/nas/config.yaml`：容器内路径配置样例，默认开启设备绑定和调度器。
 - `deploy/.env.example`：NAS 路径、端口、UID/GID 和前端 API URL 示例。
 
+Compose 必须把 `PICS_MEDIA_ROOT` 整体挂载到 `/media`，不能把 `inbox/staging/library/quarantine` 拆成多个 bind mount。分类器依赖同一文件系统内的 `rename` 移动，拆分挂载会触发 `invalid cross-device link`。
+
 发布前确认 `.gitignore` 仍排除：
 
 - `Pictures/`

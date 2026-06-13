@@ -479,3 +479,5 @@ Windows 包中可执行文件后缀为 `.exe`。
 - `Dockerfile.web`
 
 systemd 模板默认把服务限制在指定媒体目录和运行目录内写入。Docker Compose 是 NAS 推荐方式，包含后端、前端 nginx 和 MongoDB；默认后端/前端绑定到 `127.0.0.1`，MongoDB 只在 compose 内部网络暴露，并通过 `/health` 做容器健康检查。详细步骤见 [deploy/README.md](../deploy/README.md)。
+
+Docker 部署时必须把媒体根目录整体挂载为 `/media`，不要分别挂载 `inbox/staging/library/quarantine`。分类流程会在这些目录之间执行 `rename` 移动，分开挂载会被 Linux 视为跨设备移动并失败。

@@ -5,20 +5,21 @@ services:
       dockerfile: Dockerfile
     container_name: pics-manager
     restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       DATABASE_URI: mongodb://mongodb:27017
-      DATABASE_NAME: media_manager
+      DATABASE_NAME: ${DATABASE_NAME:-media_manager}
       PIC_MANAGER_MAINTENANCE_TOKEN: ${PIC_MANAGER_MAINTENANCE_TOKEN:-}
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${PICS_API_BIND:-127.0.0.1}:${PICS_API_PORT:-8080}:8080"
     volumes:
-      - ../config.yaml:/app/config.yaml:ro
-      - ./data/logs:/app/logs
-      - ./data/backups:/app/backups
-      - /srv/media/inbox:/media/inbox
-      - /srv/media/staging:/media/staging
-      - /srv/media/library:/media/library
-      - /srv/media/quarantine:/media/quarantine
+      - ./nas/config.yaml:/app/config.yaml
+      - ${PICS_DATA_ROOT:-./data}/logs:/data/logs
+      - ${PICS_DATA_ROOT:-./data}/backups:/data/backups
+      - ${PICS_MEDIA_ROOT:-/srv/media}/inbox:/media/inbox
+      - ${PICS_MEDIA_ROOT:-/srv/media}/staging:/media/staging
+      - ${PICS_MEDIA_ROOT:-/srv/media}/library:/media/library
+      - ${PICS_MEDIA_ROOT:-/srv/media}/quarantine:/media/quarantine
     depends_on:
       - mongodb
     healthcheck:
@@ -28,12 +29,29 @@ services:
       retries: 3
       start_period: 20s
 
+  pics-web:
+    build:
+      context: ..
+      dockerfile: Dockerfile.web
+      args:
+        VITE_API_BASE_URL: ${PICS_WEB_API_BASE_URL:-http://127.0.0.1:8080/api/v1}
+    container_name: pics-manager-web
+    restart: unless-stopped
+    ports:
+      - "${PICS_WEB_BIND:-127.0.0.1}:${PICS_WEB_PORT:-5173}:80"
+    depends_on:
+      - pics-manager
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   mongodb:
     image: mongo:7
     container_name: pics-manager-mongodb
     restart: unless-stopped
     command: ["mongod", "--bind_ip_all"]
     volumes:
-      - ./data/mongodb:/data/db
-    ports:
-      - "127.0.0.1:27017:27017"
+      - ${PICS_DATA_ROOT:-./data}/mongodb:/data/db

@@ -8,6 +8,7 @@ logs/
 
 .env
 .env.*
+!deploy/.env.example
 
 tmp/
 temp/

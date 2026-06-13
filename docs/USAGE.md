@@ -476,5 +476,6 @@ Windows 包中可执行文件后缀为 `.exe`。
 - `deploy/logrotate/pics-manager`
 - `deploy/docker-compose.yml`
 - `Dockerfile`
+- `Dockerfile.web`
 
-systemd 模板默认把服务限制在指定媒体目录和运行目录内写入。Docker Compose 示例默认把后端和 MongoDB 绑定到 `127.0.0.1`，并通过 `/health` 做容器健康检查；前端查看端可以单独部署。
+systemd 模板默认把服务限制在指定媒体目录和运行目录内写入。Docker Compose 是 NAS 推荐方式，包含后端、前端 nginx 和 MongoDB；默认后端/前端绑定到 `127.0.0.1`，MongoDB 只在 compose 内部网络暴露，并通过 `/health` 做容器健康检查。详细步骤见 [deploy/README.md](../deploy/README.md)。

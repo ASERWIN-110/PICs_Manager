@@ -350,6 +350,14 @@ env GOCACHE=/tmp/pics-manager-gocache CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 - `config.yaml`
 - `web-dist`
 
+Docker 部署文件：
+
+- `Dockerfile`：构建 Go 后端、CLI 和 verify-scan。
+- `Dockerfile.web`：构建 React 前端并用 nginx 提供静态查看器。
+- `deploy/docker-compose.yml`：NAS compose 模板，包含 `pics-manager`、`pics-web` 和内部 MongoDB。
+- `deploy/nas/config.yaml`：容器内路径配置样例，默认开启设备绑定和调度器。
+- `deploy/.env.example`：NAS 路径、端口、UID/GID 和前端 API URL 示例。
+
 发布前确认 `.gitignore` 仍排除：
 
 - `Pictures/`
@@ -370,5 +378,6 @@ env GOCACHE=/tmp/pics-manager-gocache CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 - `systemd/pics-manager-health-report.timer`
 - `logrotate/pics-manager`
 - `docker-compose.yml`
+- `nas/config.yaml`
 
-systemd service 使用 `ReadWritePaths` 限制可写范围。health-report timer 默认每天 03:30 运行 `pics-cli -action health-report`，用于不触发整理的每日目录健康报告，报告内包含最终库、隔离区、`.same-name` 和非媒体跳过数。Docker Compose 通过 `/health` 做后端容器健康检查。
+systemd service 使用 `ReadWritePaths` 限制可写范围。health-report timer 默认每天 03:30 运行 `pics-cli -action health-report`，用于不触发整理的每日目录健康报告，报告内包含最终库、隔离区、`.same-name` 和非媒体跳过数。Docker Compose 通过 `/health` 做后端和前端容器健康检查，MongoDB 默认不映射到宿主端口。

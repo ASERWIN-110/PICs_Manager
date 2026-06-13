@@ -1,0 +1,88 @@
+server:
+  port: ":8080"
+  timeout: 30s
+  maintenanceToken: ""
+
+security:
+  enabled: true
+  storePath: "/data/logs/auth/devices.json"
+  defaultPairingTTL: "24h"
+  defaultDeviceTTL: "0"
+  requireViewerForRead: true
+  allowLocalAdmin: true
+  corsAllowedOrigins:
+    - "http://localhost:*"
+    - "http://127.0.0.1:*"
+
+scheduler:
+  enabled: true
+  interval: "6h"
+  mode: "full"
+  runOnStartup: false
+
+runRetention:
+  maxRuns: 200
+  maxAgeDays: 90
+
+database:
+  uri: "mongodb://mongodb:27017"
+  name: "media_manager"
+
+logger:
+  level: "info"
+  format: "text"
+  path: "/data/logs"
+
+scanner:
+  mode: "full"
+  scanPath: "/media/inbox"
+  stagingPath: "/media/staging"
+  finalLibraryPath: "/media/library"
+  backupPath: "/data/backups"
+  quarantinePath: "/media/quarantine"
+  corruptionLogPath: "/data/logs/corrupted_files.log"
+  duplicatesDir: "_duplicates"
+  workerCount: 0
+  batchSize: 100
+  ioThrottleMs: 5
+  maintenanceWindow: "01:00-06:00"
+  maxFilesPerDir: 5000
+  followSymlinks: false
+
+  filePatterns:
+    - '^(.*?)_(\d+)_p(\d+)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_(\d+)_p(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_pg(\d+)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - '^(.*?)_(\d+)_p(\d+).(\.[a-zA-Z0-9_]+)?$'
+
+  mediaTypes:
+    - type: "image"
+      extensions: [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+      filePatterns:
+        - '^(.*?)_(\d+)_p(\d+)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+        - '^(.*?)_(\d+)_p(\d+)(\.[a-zA-Z0-9_]+)?$'
+        - '^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+        - '^(.*?)_pg(\d+)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+        - '^(.*?)_(\d+)_p(\d+).(\.[a-zA-Z0-9_]+)?$'
+    - type: "video"
+      extensions: [".mp4", ".mkv", ".mov", ".avi", ".wmv", ".webm", ".m4v"]
+      filePatterns:
+        - '^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - type: "audio"
+      extensions: [".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a"]
+      filePatterns:
+        - '^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+    - type: "text"
+      extensions: [".txt", ".md", ".pdf", ".epub"]
+      filePatterns:
+        - '^(.*?)_(\d+)(\.[a-zA-Z0-9_]+)?$'
+
+  seriesGroupPatterns:
+    - name: "前置序号"
+      pattern: '^\s*\(\d+\)\s*(?P<group>.*)'
+    - name: "括号"
+      pattern: '^[『「《[(【（](?P<group>.*?)[』」》)\]】）]'
+    - name: "文本+数字"
+      pattern: '^(?P<group>.+?)\s*(\d+)$'
+
